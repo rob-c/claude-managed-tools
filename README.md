@@ -3,6 +3,21 @@
 A Claude Code plugin that makes every Bash result a **timeline**. It is the Claude Code
 port of the Pi-Time feature of [pi-managed-tools](https://github.com/rob-c/pi-managed-tools).
 
+## Install
+
+```sh
+claude plugin marketplace add rob-c/claude-managed-tools
+claude plugin install managed-tools@rob-c
+```
+
+Start a new session, and `/pi-time` shows what is in force. macOS and Linux; there is no
+Windows build. On its first start the plugin downloads the one binary it needs, checked
+against its published sha256: see [The binary it needs](#the-binary-it-needs). Later
+releases arrive with `claude plugin update managed-tools@rob-c` (auto-update is off for a
+marketplace you add yourself; `/plugin` > Marketplaces turns it on).
+
+## What it does
+
 **Pi-Time** is the name for what the wrapper gives the model: the concept of time, which a
 plain text capture of an execution does not carry. Three facts come back with every
 command, each there because its absence made a model misread a run:
@@ -40,7 +55,7 @@ You see the command's own lines:
      done
 ```
 
-## Install
+## The binary it needs
 
 It needs one binary: `busybox` from [rob-c/busybox-static](https://github.com/rob-c/busybox-static)
 (a host BusyBox will not do — upstream has no `run` or `log` applet). The plugin fetches
@@ -79,17 +94,9 @@ Checked on macOS (arm64) in live sessions, and on Linux (arm64, Debian) by runni
 binary, the wrapper and the shell shim in a container; Claude Code itself was not run on
 Linux.
 
-Install it from GitHub:
+### From a clone
 
-```sh
-claude plugin marketplace add rob-c/claude-managed-tools
-claude plugin install managed-tools@rob-c
-```
-
-Later releases arrive with `claude plugin update managed-tools@rob-c` (auto-update is off
-for a marketplace you add yourself; `/plugin` > Marketplaces turns it on).
-
-Or work on it from a clone. Try it for one session:
+To work on the plugin, try it for one session:
 
 ```sh
 claude --plugin-dir ~/src/claude-managed/tools
@@ -399,6 +406,110 @@ installing the binary) and `src/prompt.ts` are specific to Claude Code.
 
 The function-hook API this plugin stands on is early access and may change between
 Claude Code releases. It was written and tested against 2.1.331.
+
+## How a command becomes a timeline, and why
+
+`dmesg` prints the kernel's log as `[    0.011354] message`: one line per event, each with
+the seconds since boot. Pi-Time gives a command's output the same shape — seconds since
+the command *started*, and the stream the line arrived on.
+
+### Why
+
+One program, three lines, 0.3 s apart: `ok 1` on stdout, `FAILED test_x` on stderr, `done`
+on stdout. Measured here with a six-line Python script:
+
+```
+what the program did            a plain capture returns   Pi-Time returns
+-----------------------------   -----------------------   -------------------------------
+0.04 s  stdout  ok 1            FAILED test_x             [0.038778666 out] ok 1
+0.34 s  stderr  FAILED test_x   ok 1                      [0.341038958 err] FAILED test_x
+0.65 s  stdout  done            done                      [0.646061250 out] done
+```
+
+The plain capture is wrong about the order, and says nothing about which stream or when.
+The program's stdout is a pipe there, so the runtime holds `ok 1` back until it exits, and
+the failure that came second arrives first: it reads as a failure before any test had
+passed. Nothing in a plain capture can show that this happened.
+
+### How
+
+```mermaid
+flowchart TD
+    subgraph CC["Claude Code, with the plugin's hooks"]
+        M["The model writes a Bash call<br/>pytest -q"]
+        G{"tool.call hook: the guard<br/>a stream merge at the tail,<br/>or a command that cannot end?"}
+        R["Refused before it runs,<br/>with what to write instead"]
+        P{"Permission check<br/>rules, mode and your answer<br/>judge pytest -q as written"}
+        X["Denied: nothing runs"]
+        W["tool.run hook: the wrapper<br/>the allowed call is re-issued through<br/>Claude Code's own Bash tool<br/>(same sandbox, shell and directory)"]
+    end
+    subgraph SH["One shell line"]
+        O["busybox run --timestamps --stamp-ns<br/>--max-bytes 24000 --pty-split<br/>--timeout 120 --idle-timeout 120<br/>--env ... -- zsh -c 'pytest -q'"]
+    end
+    subgraph BB["busybox run: the capture"]
+        C["Child shell, in its own process group<br/>stdin empty, output buffering<br/>switched off through the environment"]
+        SO(["stdout: a pseudo-terminal<br/>programs write each line<br/>when they print it"])
+        SE(["stderr: a pipe<br/>it keeps its own tag"])
+        T["Every line is stamped as it arrives<br/>seconds since the start, and out or err<br/>and saved in the run's folder<br/>$TMPDIR/busybox-run/R134"]
+        K["Deadline or silence limit:<br/>the process group is stopped,<br/>what was captured is kept"]
+        V["At exit, one bounded view<br/>a header, then the interleaved timeline<br/>(head and tail when over 24 KB)"]
+    end
+    subgraph BACK["Back in the tool.run hook"]
+        S["The result is dressed<br/>TIMEOUT or IDLE notice first<br/>a repeated offset becomes [= out]<br/>timing digest, pointer into a cut view,<br/>pipeline stage statuses"]
+    end
+    MODEL["The model reads the timeline<br/>[0.011354208 out] ok 1<br/>[2.320004125 err] FAILED test_x<br/>[8.421130000 out] done"]
+    YOU["ui.render hook: you see<br/>the command's own lines<br/>ok 1, FAILED test_x, done"]
+
+    M --> G
+    G -->|yes| R
+    G -->|no| P
+    P -->|denied| X
+    P -->|allowed| W
+    W --> O
+    O --> C
+    C --> SO
+    C --> SE
+    SO --> T
+    SE --> T
+    C -.->|still running or silent| K
+    T --> V
+    K -.-> V
+    V --> S
+    S --> MODEL
+    S --> YOU
+```
+
+Each step is where it is for a reason:
+
+1. **The guard runs before the permission check**, because nobody should be asked to
+   approve a command that will be refused anyway. `2>&1` at a command's tail merges the
+   streams inside the command, before anything can tag them; a pager or `tail -f` would
+   only run to the deadline.
+2. **The wrapper runs after the permission check.** Rules, the mode and your own answer
+   judge `pytest -q`, never `busybox run … -c 'pytest -q'`, so every allow and deny rule
+   you have keeps meaning what it meant.
+3. **stdout is a pseudo-terminal and stderr is a pipe.** A runtime line-buffers when its
+   stdout is a terminal, so an offset is the moment of the write and not of a flush at
+   exit — the fault in the table above. stderr is unbuffered either way, and on its own
+   pipe it stays tagged `err`. Where a program's stdout is not the terminal (a stage in a
+   pipeline, a redirect to a file), buffering is switched off through the environment
+   instead: see [Buffering](#buffering).
+4. **Lines are stamped on arrival, in one interleaved stream.** Two streams captured
+   apart cannot be put back in order afterwards; one stream with an offset on every line
+   keeps the order and the intervals.
+5. **The deadline belongs to the capture, not to the host.** It is set to fire before
+   Claude Code's own would, so a hang ends with its timeline intact and a named `TIMEOUT`
+   rather than with nothing.
+6. **The view is bounded and the capture is not.** What comes back fits under Claude
+   Code's inline limit; everything the command printed is in the run's folder, and
+   `busybox log R134` reads any part of it.
+7. **The hook dresses the result last**, with what only it knows: which deadline fired,
+   which lines a cut view is missing, how each stage of a pipeline ended.
+8. **Two readers, one result.** The stored result, which the model reads, keeps every
+   offset; the row you see is the same text with the offsets taken off.
+
+The flags shown are abridged. A `!` command you type takes a shorter path to the same
+capture, through the shell shim: see [Your own commands](#your-own-commands--and-sh).
 
 ## Licence
 
