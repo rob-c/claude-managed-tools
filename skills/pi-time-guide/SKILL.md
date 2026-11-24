@@ -1,7 +1,7 @@
 ---
 name: pi-time-guide
 user-invocable: false
-description: "How to read and work with Pi-Time, the timeline every Bash result comes back as in this session: lines prefixed `[0.012345 out]` / `[0.012349 err]` (or padded, `[   0.012345 out]`; or `[= out]` for a line at the same offset as the one above), a `run=R12 exit_code=… duration_ms=…` header, a `timing:` digest, a `TIMEOUT` notice, `truncated=true` views. Load it when a Bash result carries those prefixes and you need to reason about ordering, duration, which stream a line came from, a deadline, or how to read the rest of a truncated or past run with `busybox log`; when a command was refused for a stream merge at its tail; or when you need byte-exact output. Never merge stderr into stdout — the merge happens before the timeline can tag anything."
+description: "How to read Pi-Time, the timeline every Bash result comes back as in this session: a `run=R12 exit_code=… duration_ms=…` header, `[0.012 out]` / `[0.340 err]` stamps that each start a burst of lines, notes after `--- pi-time ---`, a `TIMEOUT` or `IDLE` notice, `truncated=true` views. Load it to reason about ordering, duration or which stream a line came from, to read the rest of a truncated or past run with `busybox log`, when a command was refused before it ran, or when you need byte-exact output."
 ---
 
 # Pi-Time
@@ -10,44 +10,56 @@ Pi-Time attaches time itself to every Bash execution — **which stream**, **whe
 **how long is too long** — because a plain capture cannot say which stream a line came
 from, when it arrived, or whether a run that stopped had failed or was stopped.
 
-Every foreground Bash command runs through `busybox run --timestamps`: one interleaved
-line per record, with its offset and the stream it arrived on.
+Every foreground Bash command runs through `busybox run --timestamps`, and comes back
+with the stream and the moment each line arrived.
 
 ```
-run=R134 exit_code=0 timed_out=false cancelled=false duration_ms=8421
-timeline_lines=3 shown=3 truncated=false
---- timeline ---
-[0.011354208 out] ok 1
-[2.320004125 err] FAILED test_x
-[8.421130000 out] done
-timing: 8.42s total, 3 lines, output from 0.01s, stderr from 2.32s, longest pause 6.10s (2.32s → 8.42s)
+run=R134 exit_code=0 duration_ms=8421
+[0.011 out] collecting
+collected 12 items
+ok 1
+[2.320 err] FAILED test_x
+  assert 3 == 4
+[= out] [INFO] retrying
+[8.421 out] done
+--- pi-time ---
+timing: 8.42s total, 7 lines, output from 0.01s, stderr from 2.32s, longest pause 6.10s (2.32s → 8.42s)
 ```
 
-The offset is seconds since the command started, as a decimal number: nine decimals
-(nanoseconds, where two events in the same microsecond still keep their order) on a
-current build. Other builds pad the number to a fixed width (`[   0.011354 out]`,
-`[00000.011354208 out]`) or print fewer decimals (`[0.011354 out]`, `[1.225 out]`). It is
-the same field in every shape.
+- **The header** is one line: the run's id (what `busybox log` takes), the command's exit
+  code and how long it ran. A field appears only when it says something: `timed_out=true`,
+  `idle=true` or `cancelled=true` when the run was stopped, and a second line
+  `timeline_lines=3000 shown=724 truncated=true` when the view was cut.
+- **A stamp starts a burst.** `[0.011 out]` is seconds since the command started, and the
+  stream the line arrived on. Every line under it that has no stamp arrived at that same
+  offset on that same stream: `collected 12 items` and `ok 1` are stdout at 0.011 s, and
+  `  assert 3 == 4` is stderr at 2.320 s.
+- **`[= out]` or `[= err]`** is a line at the same offset as the one above that needed a
+  mark of its own: the stream changed, or its own text begins with `[` or looks like a
+  line of the capture's. Above, `[INFO] retrying` is stdout at 2.320 s.
+- **`--- pi-time ---`** ends the command's output. What follows is the capture's own:
+  the `timing:` digest, the pointer into a truncated view, notes on what the command hid.
 
-A line that arrived at the same offset as the line above it carries `[= out]` or
-`[= err]` instead of the digits: the same instant, said once. Three lines flushed together
-read `[0.011354208 out] a`, `[= out] b`, `[= err] c` — one burst, with the stream still
-named on each. (`busybox log` prints every offset in full when you read a run back.)
+Offsets are cut to the millisecond, never rounded up. The capture itself keeps nanoseconds,
+and `busybox log` prints every line with its full stamp when you read a run back — use it
+when two events inside one millisecond have to be told apart.
 
 ## Reading it
 
 - **The offsets are facts.** The failure came *after* `ok 1` and *before* `done`. Read
   them before concluding anything about causality, order or duration — never answer
   "undetermined" about something the offsets state.
-- **A burst of lines sharing one offset** is a writer that flushed at exit rather than
+- **A long burst under one stamp** is a writer that flushed at once rather than
   streaming. That is information about the program, not about the wrapper.
+- **Every change of stream is marked.** A line is on the stream of the nearest stamp above
+  it; a line with no stamp is never on another stream than the line before it.
 - **`timing:`** appears on runs over a second: total, where output began, where stderr
   began, and the longest silence. It is the quickest way to see where the time went.
 - **The header's `exit_code`** is the command's own status. In a pipeline it is the last
   stage's, and the result says so when that misleads (`head` closing the pipe, `grep`'s
   1 meaning "no match", a `|| true` mask).
-- **The person watching sees the command's own lines**, without the prefixes. Do not
-  strip or re-print the timeline for them, and do not quote the prefixes back unless the
+- **The person watching sees the command's own lines**, without the stamps. Do not
+  strip or re-print the timeline for them, and do not quote the stamps back unless the
   timing is the point.
 
 ## The terminal
@@ -128,21 +140,29 @@ and its first words are `TIMEOUT — not a failure of the command`:
 - the command was *stopped*, it did not error — `exit_code=-1` and "Exit code 3" are the
   kill status;
 - everything it printed before the kill is in the result, and the capture is complete;
+- a line beginning `CPU:` says what the processor was doing, when the command was watched:
+  "it used 117.3s of processor time in 120s and was still computing" means it was working
+  and needs longer; "…and none at the end" means it was waiting, and more time alone will
+  not help;
 - the next move is a larger `timeout` (milliseconds), a narrower command, or
   `run_in_background: true` — not a debugging detour.
 
 Three other notices name an ending that is not the command's own exit, each with
 `exit_code=-1` in the header:
 
-- **`IDLE`** — the command printed nothing on either stream for the silence limit (120 s
-  unless configured otherwise; the system prompt gives the number when one is in force)
-  and was taken to be stuck. The limit holds whatever `timeout` the call named, so a
+- **`IDLE`** — the command showed no sign of life for the silence limit (120 s unless
+  configured otherwise; the system prompt gives the number when one is in force) and was
+  stopped as stuck. A sign of life is a line on either stream *or* processor time, so the
+  notice says both: "for 121s it printed nothing and used no processor time to speak of".
+  It was waiting, not working, and the limit holds whatever `timeout` the call named, so a
   larger `timeout` does not help. It was not waiting on standard input: stdin is empty
   here and a read returns end-of-file at once (the notice says so when that is not true of
   the terminal mode in use). Look at what else blocks — a lock, a socket, a child that
-  never exits, a prompt that opens the terminal itself (`sudo`, `ssh`). If it was working
-  quietly, make it report progress (a verbose flag; any line on either stream resets the
-  clock) or use `run_in_background: true`.
+  never exits, a prompt that opens the terminal itself (`sudo`, `ssh`). A command that is
+  meant to wait belongs in `run_in_background: true`. (Where a command could not be
+  watched — the system prompt then says "prints nothing" rather than "neither prints nor
+  uses the processor" — silence alone decided, and a quiet command that was working may
+  have been stopped: make it report progress.)
 - **`CANCELLED`** — stopped on request (an interrupt), not by a failure.
 - **`KILLED`** — the command's shell was ended by a signal.
 

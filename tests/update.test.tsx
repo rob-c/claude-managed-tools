@@ -210,9 +210,8 @@ test("the model is told what this build's offsets look like and what its log can
 	on("prompt.compose", () => ({ sections: [] }));
 	const base = { model: "m", promptModel: "m", surfaces: [], outputStyle: null, traits: [], tools: ["Bash"] };
 	const text = (await $.prompt.compose(base)).sections[0]?.text ?? "";
-	expect(text).toMatch(/`\[0\.012345678 out\] text`/);
-	expect(text).toMatch(/to the nanosecond/);
-	expect(text).toMatch(/`--sample N` gives its first and last N lines/);
+	expect(text).toMatch(/`\[0\.012 out\] text` starts a burst/);
+	expect(text).toMatch(/`--sample N`, `--since S --until S`, `--around-gap 1`/);
 });
 
 test("on a first start with no binary anywhere, the latest release is fetched, verified and used", async ($, on) => {

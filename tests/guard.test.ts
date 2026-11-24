@@ -13,7 +13,9 @@ describe("the tail-zone merge guard", () => {
 	test("catches the reflex shapes at the command's tail", () => {
 		for (const command of [
 			"cmd >srv.log 2>&1 &",
-			"cmd >/dev/null 2>&1",
+			"make > build.log 2>&1",
+			// stderr to the *original* stdout, which is the view: the order matters.
+			"cmd 2>&1 >/dev/null",
 			"make -j8 2>&1",
 			"python3 app.py |& grep ERROR",
 			"cmd &> out.txt",

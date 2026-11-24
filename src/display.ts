@@ -44,6 +44,7 @@ const WRAPPER_LINE = new RegExp(
 		"^\\[brief\\] ", // brief's own reduction marker
 		"^pruned=\\d+ keep=\\d+$", // --prune's own report, from a capture made before it was dropped
 		"^timing: ", // the model-facing digest appended to the result
+		"^--- pi-time ---$", // what separates the command's lines from the capture's notes
 	].join("|"),
 );
 
@@ -60,6 +61,8 @@ const TIMELINE_PREFIX = /^\[(?:\s*\d+\.\d{1,9}|=) (?:out|err)\] /;
 /** Whether this text carries a timeline at all, so callers can skip the work. */
 export function hasTimeline(text: string): boolean {
 	if (TIMELINE_PREFIX.test(text) || /^timeline_lines=/m.test(text) || /^--- timeline ---$/m.test(text)) return true;
+	// The header as the model is shown it since 0.6.0: one line, and no marker after it.
+	if (/^run=R\d+ exit_code=-?\d+ (?:[a-z_]+=\S+ )*duration_ms=\d+$/m.test(text)) return true;
 	// The sectioned view (`brief`) has no per-line prefix, but it is still the wrapper's:
 	// its header and its section markers are decoration a person should not have to read.
 	return /^run=R\d+ exit_code=-?\d+ /m.test(text) && /^--- (?:stdout|stderr) ---$/m.test(text);

@@ -27,8 +27,9 @@
  *               only then is it re-issued as `busybox run --timestamps … -- sh -c '…'`.
  *               That order is the whole design: a rewrite ahead of the permission check
  *               would make every allow rule stop matching and every deny rule blind.
- *   ui.render   the human's view: the same result drawn without the prefixes. The stored
- *               result, which the model reads, keeps them.
+ *   ui.render   the human's view: the same result drawn without the prefixes (the stored
+ *               result, which the model reads, keeps them), and while a command runs, its
+ *               newest lines and a sign of life under its row.
  *   prompt.compose  what the model is told about the timeline, while it is on.
  *   command.run     `/pi-time`: status, switches for this session, and the install.
  *
@@ -61,12 +62,13 @@ import {
 	type StampShape,
 } from "../src/busybox";
 import { dropHousekeeping, hasTimeline, stripTimeline } from "../src/display";
+import { CpuMeter, type CpuReading, cpuSentence, groupCpuSeconds, isStuck, lifeLine, liveDir, liveFile, type LivePointer, LiveTail, parsePointer, PS_ARGV } from "../src/live";
 import { blockReason, detectEndless, detectTailMerge, endlessReason, guardEnabled, hasOverride, resultNotes, type RunFacts, takeFacts } from "../src/guard";
 import { planDeadline, shellCandidates } from "../src/policy";
 import { sectionId, sectionText } from "../src/prompt";
 import { isPersonsOwn, modelContext, personText, SHELL_DESCRIPTION, SHELL_HINT, SHELL_USAGE } from "../src/shell";
 import { bashBlock, confText, draftKeys, SHIM_SOURCE, shimDir, shimName, withStdout } from "../src/shim";
-import { compactStamps, outcomeNotice, parseDurationMs, parseHeader, parseTimeline, type RunHeader, summarizeTiming, truncationHint } from "../src/timing";
+import { compactStamps, NOTES_MARKER, outcomeNotice, parseDurationMs, parseHeader, parseTimeline, type RunHeader, slimHeader, summarizeTiming, truncationHint } from "../src/timing";
 import {
 	describeVerbosity,
 	isWrapped,
@@ -172,10 +174,59 @@ const session: {
 	roots: Set<string>;
 	/** Captures removed by this session's sweeps. */
 	swept: number;
+	/**
+	 * Whether a running command could be watched, by kind of call (sandboxed or not): false
+	 * once a command's own report of itself never turned up, as in a sandbox that cannot
+	 * write it. Such calls then fall back to the applet's own silence limit.
+	 */
+	liveWorks: Map<string, boolean>;
+	/** The folder for those reports has been made this session. */
+	hasLiveDir?: boolean;
+	/** Commands stopped by the hooks module for showing no sign of life. */
+	stuck: number;
 	wrapped: number;
 	refused: number;
 	blocked: number;
-} = { wrapped: 0, refused: 0, blocked: 0, swept: 0, draft: Promise.resolve(), seenNotes: new Set(), roots: new Set() };
+} = { wrapped: 0, refused: 0, blocked: 0, swept: 0, stuck: 0, draft: Promise.resolve(), seenNotes: new Set(), roots: new Set(), liveWorks: new Map() };
+
+/** Before a running command is looked at: most commands are over by then, and pay nothing. */
+const LIVE_DELAY_MS = 1500;
+/** How often a running command's capture is read. */
+const LIVE_INTERVAL_MS = 500;
+/** Every this many reads, the processor is sampled too (`ps` costs more than a stat). */
+const CPU_EVERY = 6;
+/** How long a command has to report itself before the watch is given up. */
+const LIVE_GIVE_UP_MS = 6000;
+/** The most of a burst of output that is read for the live view. */
+const LIVE_READ_BYTES = 16 * 1024;
+
+/** One running command, as the hooks module watches it. */
+interface Live {
+	/** Where the command's shell says which capture and which process group are its own. */
+	file: string;
+	/** The kind of call, for remembering whether such calls can be watched at all. */
+	kind: string;
+	startedAt: number;
+	pointer?: LivePointer;
+	sizes: { stdout: number; stderr: number };
+	tail: LiveTail;
+	hasOutput: boolean;
+	lastOutputAt: number;
+	meter: CpuMeter;
+	/** Whether the last `ps` listed the command's group: nothing is signalled that was not just seen. */
+	isGroupSeen: boolean;
+	/** The silence limit this watch enforces, in milliseconds; 0 when the applet enforces its own. */
+	idleMs: number;
+	/** Set when this watch stopped the command for showing no sign of life. */
+	stopped?: { seconds: number; cpuSeconds?: number };
+	timers: Array<{ cancel: () => void }>;
+	ticks: number;
+	isPolling: boolean;
+	isDone: boolean;
+}
+
+/** The commands running now, by the id of the call the model made. */
+const running = new Map<string, Live>();
 
 /** How many wrapped commands pass between two sweeps of the captures. */
 const SWEEP_EVERY = 25;
@@ -198,7 +249,7 @@ function count(value: string | undefined): number | undefined {
 
 /** Every variable the module reads, each by its literal name so `validate` can list them. */
 async function readEnv($: Engine): Promise<Env> {
-	const [wrap, verbosity, pty, timeout, extraEnv, guard, busybox, shell, claudeShell, home, hostDefault, hostMax, idle, update, unbuffer, preload, compact, tmpdir] =
+	const [wrap, verbosity, pty, timeout, extraEnv, guard, busybox, shell, claudeShell, home, hostDefault, hostMax, idle, update, unbuffer, preload, compact, tmpdir, digits, liveSwitch] =
 		await Promise.all([
 			$.env.get("CLAUDE_MANAGED_TOOLS_WRAP"),
 			$.env.get("CLAUDE_MANAGED_TOOLS_VERBOSITY"),
@@ -218,6 +269,8 @@ async function readEnv($: Engine): Promise<Env> {
 			$.env.get("CLAUDE_MANAGED_TOOLS_PRELOAD"),
 			$.env.get("CLAUDE_MANAGED_TOOLS_COMPACT_STAMPS"),
 			$.env.get("TMPDIR"),
+			$.env.get("CLAUDE_MANAGED_TOOLS_STAMP_DIGITS"),
+			$.env.get("CLAUDE_MANAGED_TOOLS_LIVE"),
 		]);
 	return {
 		CLAUDE_MANAGED_TOOLS_WRAP: wrap,
@@ -238,6 +291,8 @@ async function readEnv($: Engine): Promise<Env> {
 		CLAUDE_MANAGED_TOOLS_PRELOAD: preload,
 		CLAUDE_MANAGED_TOOLS_COMPACT_STAMPS: compact,
 		TMPDIR: tmpdir,
+		CLAUDE_MANAGED_TOOLS_STAMP_DIGITS: digits,
+		CLAUDE_MANAGED_TOOLS_LIVE: liveSwitch,
 	};
 }
 
@@ -254,6 +309,8 @@ function settingsFor(env: Env, options: Options): WrapSettings {
 			unbuffer: flag(options.unbuffer, true),
 			preload: flag(options.preloadStdbuf, false),
 			compactStamps: flag(options.compactStamps, true),
+			stampDigits: typeof options.stampDigits === "number" ? options.stampDigits : undefined,
+			live: flag(options.live, true),
 			extraEnv: text(options.extraEnv),
 		},
 		session.verbosity,
@@ -591,6 +648,131 @@ function captureFlags(found: Found, settings: WrapSettings): { stampNs: boolean;
 }
 
 /**
+ * Begin watching one call: where its command will report itself, and what limit applies.
+ *
+ * Undefined when there is nothing to watch with — the setting is off, there is no data
+ * folder, or such calls have already shown that they cannot report themselves.
+ */
+async function openLive($: Engine, callId: string, kind: string, settings: WrapSettings): Promise<Live | undefined> {
+	if (!settings.live || session.liveWorks.get(kind) === false) return undefined;
+	const dir = await dataDir($);
+	if (!dir) return undefined;
+	if (!session.hasLiveDir) {
+		// `fs.write` makes the folder; the command's shell cannot be asked to.
+		await $.fs.write(`${liveDir(dir)}/.keep`, "");
+		session.hasLiveDir = true;
+	}
+	const now = await $.clock.now();
+	return {
+		file: liveFile(dir, callId),
+		kind,
+		startedAt: now,
+		sizes: { stdout: 0, stderr: 0 },
+		tail: new LiveTail(),
+		hasOutput: false,
+		lastOutputAt: now,
+		meter: new CpuMeter(),
+		isGroupSeen: false,
+		idleMs: settings.idleSeconds * 1000,
+		timers: [],
+		ticks: 0,
+		isPolling: false,
+		isDone: false,
+	};
+}
+
+/** Start the clock on a watch: nothing is read until the command has run for a moment. */
+function watch($: Engine, live: Live): void {
+	live.timers.push(
+		$.clock.after(LIVE_DELAY_MS, () => {
+			if (live.isDone) return;
+			live.timers.push($.clock.every(LIVE_INTERVAL_MS, () => void look($, live).catch(() => undefined)));
+			void look($, live).catch(() => undefined);
+		}),
+	);
+}
+
+/** Stop watching: the command has ended, or cannot be watched. */
+function closeLive(live: Live): void {
+	live.isDone = true;
+	for (const timer of live.timers) timer.cancel();
+	live.timers = [];
+}
+
+/**
+ * Look at a running command once: new output, the processor, and whether it is stuck.
+ *
+ * Never in front of the command: this runs on a timer while the call is awaited, and a
+ * look that is still under way when the next is due is skipped.
+ */
+async function look($: Engine, live: Live): Promise<void> {
+	// Once it has been told to stop there is nothing more to decide, and it is told once.
+	if (live.isPolling || live.isDone || live.stopped) return;
+	live.isPolling = true;
+	try {
+		const now = await $.clock.now();
+		if (!live.pointer) {
+			const reported = await $.fs.read(live.file).catch(() => "");
+			live.pointer = parsePointer(typeof reported === "string" ? reported : "");
+			if (!live.pointer) {
+				// Never reported itself: a sandbox that cannot write here, most likely. Such
+				// calls are not watched again, and get the applet's own silence limit instead.
+				if (now - live.startedAt > LIVE_GIVE_UP_MS) {
+					session.liveWorks.set(live.kind, false);
+					closeLive(live);
+				}
+				return;
+			}
+			session.liveWorks.set(live.kind, true);
+		}
+		const pointer = live.pointer;
+		let hasGrown = false;
+		for (const stream of ["stdout", "stderr"] as const) {
+			const path = `${pointer.runDir}/${stream}`;
+			const size = (await $.fs.stat(path).catch(() => undefined))?.size ?? 0;
+			if (size <= live.sizes[stream]) continue;
+			const from = Math.max(live.sizes[stream], size - LIVE_READ_BYTES);
+			const added = await $.fs.read(path, { offset: from, length: size - from }).catch(() => "");
+			live.sizes[stream] = size;
+			if (typeof added === "string") live.tail.push(added);
+			hasGrown = true;
+		}
+		if (hasGrown) {
+			live.hasOutput = true;
+			live.lastOutputAt = now;
+			live.meter.sawOutput();
+		}
+		if (live.ticks++ % CPU_EVERY === 0) {
+			const listed = await $.process.run([...PS_ARGV], { timeoutMs: 5_000 }).catch(() => undefined);
+			const seconds = listed?.exitCode === 0 ? groupCpuSeconds(listed.stdout, pointer.pgid) : undefined;
+			live.isGroupSeen = seconds !== undefined;
+			live.meter.sample(seconds, now);
+		}
+		const cpu = cpuOf(live, now);
+		const silentMs = now - live.lastOutputAt;
+		const watchedFrom = Math.max(live.meter.since() ?? now, live.lastOutputAt);
+		// Only a group that `ps` listed a moment ago is ever signalled.
+		if (live.isGroupSeen && isStuck({ silentMs, idleMs: live.idleMs, cpu, cpuWatchedMs: now - watchedFrom })) {
+			live.stopped = { seconds: Math.round(silentMs / 1000), ...(cpu ? { cpuSeconds: cpu.sinceOutput } : {}) };
+			session.stuck++;
+			const group = `-${pointer.pgid}`;
+			await $.process.run(["kill", "-TERM", "--", group], { timeoutMs: 5_000 }).catch(() => undefined);
+			// A command that ignores the request is not left running behind a result that says it was stopped.
+			live.timers.push($.clock.after(3000, () => void (live.isDone ? undefined : $.process.run(["kill", "-KILL", "--", group], { timeoutMs: 5_000 }).catch(() => undefined))));
+			return;
+		}
+		$.ui.invalidate("ui.render");
+	} finally {
+		live.isPolling = false;
+	}
+}
+
+/** The processor reading of a watched command, or undefined once it has gone stale. */
+function cpuOf(live: Live, now: number): CpuReading | undefined {
+	return live.meter.reading(now, LIVE_INTERVAL_MS * CPU_EVERY * 3);
+}
+
+/**
  * How many stderr lines a run captured in all, from `log --summary`.
  *
  * Undefined when it cannot be asked or the answer is not about this run: run ids are
@@ -631,6 +813,10 @@ interface Settle {
 	cwdCarried: boolean;
 	/** The call ran outside the capture (`# pitime-raw`), so there is no timeline to read. */
 	escaped?: boolean;
+	/** What the watch saw of the processor, when the command ran long enough to be watched. */
+	cpu?: CpuReading;
+	/** Set when the watch stopped the command for showing no sign of life. */
+	stuck?: { seconds: number; cpuSeconds?: number };
 }
 
 /**
@@ -674,11 +860,21 @@ async function settle($: Engine, input: Settle): Promise<string> {
 		input.isPersons === true,
 		// The one mode where a read on stdin waits (measured); a `!` command's stdin is the host's own `/dev/null`.
 		input.settings.pty === "raw" && input.isPersons !== true,
+		{
+			cpu: cpuSentence(input.cpu, header?.durationMs === undefined ? undefined : header.durationMs / 1000),
+			...(input.stuck ? { stuck: input.stuck } : {}),
+		},
 	);
-	const shown = header && input.settings.compactStamps ? compactStamps(body) : body;
+	// What the model reads of the capture itself: a header with only what says something,
+	// and each offset once and no more precisely than it is read. Every parser above read
+	// the capture as `run` printed it; this is the last step.
+	const shown = header
+		? compactStamps(slimHeader(body), { digits: input.settings.stampDigits, burst: input.settings.compactStamps })
+		: body;
 	const root = runRootOf(input.facts?.runDir);
 	if (root) session.roots.add(root);
-	return [...(notice ? [notice] : []), shown, ...after].join("\n");
+	// With one stamp per burst a note has no mark of its own to tell it from output.
+	return [...(notice ? [notice] : []), shown, ...(header && after.length > 0 ? [NOTES_MARKER] : []), ...after].join("\n");
 }
 
 /**
@@ -806,7 +1002,7 @@ async function status($: Engine, options: Options): Promise<string> {
 	}
 	if (session.updateNote) lines.push(`- last update check: ${session.updateNote}`);
 	lines.push(
-		`- view: ${settings.verbosity} — ${describeVerbosity(settings.verbosity)}${settings.verbosity === "brief" ? "" : settings.compactStamps ? "; an offset is printed once per burst (`[= out]` for a line at the offset of the one above)" : "; every line carries its full offset (`compactStamps` is off)"}`,
+		`- view: ${settings.verbosity} — ${describeVerbosity(settings.verbosity)}${settings.verbosity === "brief" ? "" : `; offsets to ${settings.stampDigits} decimal${settings.stampDigits === 1 ? "" : "s"}, ${settings.compactStamps ? "one stamp per burst (a line at the offset and on the stream of the one above carries none)" : "a stamp on every line (`compactStamps` is off)"}`}`,
 	);
 	lines.push(
 		`- captures: kept in \`${defaultRunRoot(env.TMPDIR)}\` for \`busybox log\` — at least ${RUN_MIN_AGE_MINUTES / 60} hours, and the newest ${RUN_RETENTION} for longer (${session.swept} removed by this session)`,
@@ -822,6 +1018,13 @@ async function status($: Engine, options: Options): Promise<string> {
 		session.isPtyRefused && settings.pty !== "off"
 			? `- terminal: ${settings.pty}, but the sandbox refuses a pseudo-terminal, so sandboxed commands run on plain pipes (offsets of a block-buffering program are its flushes)`
 			: `- terminal: ${settings.pty} — ${describePty(settings.pty)}`,
+	);
+	lines.push(
+		!settings.live
+			? "- while a command runs: nothing is shown until it ends (`live` is off), and silence alone decides whether it is stuck"
+			: [...session.liveWorks.values()].includes(false)
+				? "- while a command runs: its newest lines and a sign of life under its row — but not for sandboxed commands here, which cannot report themselves and are judged by silence alone"
+				: `- while a command runs: its newest lines and a sign of life under its row; it is stopped as stuck only when it has neither printed nor used the processor for the silence limit (${session.stuck} stopped this session)`,
 	);
 	lines.push(await describeBuffering($, settings));
 	lines.push(
@@ -958,6 +1161,9 @@ export const register: Register = (on, options) => {
 				// Captures are no longer pruned by each run (the root is shared): sweep the
 				// old ones here, and again every SWEEP_EVERY commands.
 				if (found) sweep($, env);
+				// A call that was cut short leaves its small report behind; a day is long enough.
+				const data = await dataDir($);
+				if (data) void $.process.run(["find", liveDir(data), "-maxdepth", "1", "-type", "f", "-mtime", "+1", "-delete"]).catch(() => undefined);
 				// The shim is only worth standing up where there is something to wrap with.
 				if (found) await setupShim($, env, options);
 				// Behind the session, not in front of it: a first start with no binary wraps
@@ -1231,6 +1437,8 @@ export const register: Register = (on, options) => {
 				stamp: found.stamp,
 				header: found.header,
 				compactStamps: settings.compactStamps,
+				stampDigits: settings.stampDigits,
+				idleByProcessor: settings.live && ![...session.liveWorks.values()].includes(false),
 				idleSeconds: captureFlags(found, settings).idleSeconds,
 				logQuery: found.abilities.logQuery,
 				unbuffer: settings.unbuffer,
@@ -1298,6 +1506,11 @@ export const register: Register = (on, options) => {
 		const shell = await pickShell($, env);
 		const streams = await streamOptions($, settings);
 		const capture = captureFlags(found, settings);
+		// The sandbox refuses a pseudo-terminal; once it has, sandboxed calls skip the attempt.
+		const isSandboxed = e.dangerouslyDisableSandbox !== true;
+		// A command that can be watched is judged by output *and* processor, here; one that
+		// cannot keeps the applet's own limit, which knows only silence.
+		const live = await openLive($, e.tool_use_id, isSandboxed ? "sandboxed" : "open", settings).catch(() => undefined);
 		const wrapFor = (pty: PtyMode) =>
 			wrapCommand(e.command, {
 				busybox: found.path,
@@ -1310,9 +1523,8 @@ export const register: Register = (on, options) => {
 				carryCwd,
 				report: true,
 				...capture,
+				...(live ? { idleSeconds: 0, liveFile: live.file } : {}),
 			});
-		// The sandbox refuses a pseudo-terminal; once it has, sandboxed calls skip the attempt.
-		const isSandboxed = e.dangerouslyDisableSandbox !== true;
 		const pty: PtyMode = isSandboxed && session.isPtyRefused ? "off" : settings.pty;
 		const wrapped = wrapFor(pty);
 
@@ -1336,6 +1548,10 @@ export const register: Register = (on, options) => {
 
 		if (started.size > 200) started.clear();
 		started.add(e.tool_use_id);
+		if (live) {
+			running.set(e.tool_use_id, live);
+			watch($, live);
+		}
 		let ran = await reissue(wrapped);
 		if (pty !== "off" && ran.deny === undefined && ran.isError === true && ptyWasRefused(ran.text ?? "")) {
 			// No terminal to be had, and so no command started: the same call on plain pipes.
@@ -1343,6 +1559,11 @@ export const register: Register = (on, options) => {
 			ran = await reissue(wrapFor("off") ?? wrapped);
 		}
 		started.delete(e.tool_use_id);
+		const seen = live ? { cpu: cpuOf(live, await $.clock.now()), stuck: live.stopped } : {};
+		if (live) {
+			closeLive(live);
+			running.delete(e.tool_use_id);
+		}
 
 		if (ran.deny !== undefined && next.signal.aborted) {
 			// The person pressed Esc (or the turn was aborted) while the command ran: the
@@ -1363,7 +1584,16 @@ export const register: Register = (on, options) => {
 			};
 		}
 		noteWrapped($, env);
-		const about = { command: e.command, found, settings, budgetSeconds: plan.budgetSeconds, idleSeconds: capture.idleSeconds, cwdCarried: carryCwd };
+		const about = {
+			command: e.command,
+			found,
+			settings,
+			budgetSeconds: plan.budgetSeconds,
+			idleSeconds: capture.idleSeconds,
+			cwdCarried: carryCwd,
+			...(seen.cpu ? { cpu: seen.cpu } : {}),
+			...(seen.stuck ? { stuck: seen.stuck } : {}),
+		};
 		if (ran.isError === true) {
 			// A failed command stays a failed command: the model reads the same error text
 			// the host built ("Exit code 4", then the timeline), with Pi-Time's lines around
@@ -1379,6 +1609,11 @@ export const register: Register = (on, options) => {
 		const stdout = await settle($, { ...about, body, facts: taken.facts }).catch(() => body);
 		return { result: { ...ran.result, stdout, stderr: taken.stderr } };
 	}).catch(($, e, next) => {
+		const live = running.get(e.tool_use_id);
+		if (live) {
+			closeLive(live);
+			running.delete(e.tool_use_id);
+		}
 		if (next.called) return next(e);
 		if (!started.delete(e.tool_use_id)) return next(e);
 		return {
@@ -1417,9 +1652,39 @@ export const register: Register = (on, options) => {
 		return output === e.props.output ? next(e) : next({ ...e, props: { ...e.props, output } });
 	}).catch(($, e, next) => next(e));
 
-	on("ui.render", { component: "ToolUse" }, ($, e, next) => {
-		if (e.props.tool !== "Bash" || !flag(options.cleanDisplay, true)) return next(e);
+	/**
+	 * A running command's row: its newest lines, and a sign of life.
+	 *
+	 * `busybox run` prints its view when the command ends, so without this a slow command
+	 * is an empty row for as long as it takes. What is drawn here is read from the capture
+	 * as it grows, and from the processor: "CPU busy: working" under a silent compile,
+	 * "CPU idle: waiting on something" under a hang. The model is sent none of it; it
+	 * reads the result.
+	 */
+	on("ui.render", { component: "ToolUse" }, async ($, e, next) => {
+		if (e.props.tool !== "Bash") return next(e);
+		const live = e.props.isRunning ? running.get(e.props.tool_use_id) : undefined;
+		if (live?.pointer && !live.isDone) {
+			const now = await $.clock.now();
+			const { Box, Text } = $.ui.resolve(e);
+			const rows = live.tail.shown();
+			const life = lifeLine({
+				elapsedMs: now - live.startedAt,
+				silentMs: now - live.lastOutputAt,
+				hasOutput: live.hasOutput,
+				cpu: cpuOf(live, now),
+				idleMs: live.idleMs,
+			});
+			const lines = [...rows, life].map((line, index) => `${index === 0 ? "  ⎿  " : "     "}${line}`);
+			return (
+				<Box flexDirection="column">
+					{await next(e)}
+					<Text dimColor>{lines.join("\n")}</Text>
+				</Box>
+			);
+		}
+		if (!flag(options.cleanDisplay, true)) return next(e);
 		const output = forDisplay(e.props.output);
 		return output === e.props.output ? next(e) : next({ ...e, props: { ...e.props, output } });
-	});
+	}).catch(($, e, next) => next(e));
 };

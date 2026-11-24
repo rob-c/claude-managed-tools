@@ -61,6 +61,10 @@ interface WorldOptions {
 	runs?: Array<[name: string, ageMinutes: number]>;
 	/** What `busybox log <run> --summary` answers. */
 	summary?: string;
+	/** Files a test puts on disk and changes as it goes: read, and sized, as they stand. */
+	disk?: Record<string, string>;
+	/** What `ps -A -o pgid=,time=` prints, each time it is asked. */
+	ps?: () => string;
 }
 
 /**
@@ -90,7 +94,11 @@ function world(on: On, options: WorldOptions = {}): World {
 		seen.setEnv[e.name] = e.value;
 		return { value: {} };
 	});
-	on("fs.read", () => ({ deny: "ENOENT" }));
+	on("fs.read", (_, e) => {
+		const text = options.disk?.[e.path];
+		if (text === undefined) return { deny: "ENOENT" };
+		return { value: e.offset === undefined ? text : text.slice(e.offset, e.offset + (e.length ?? text.length)) } as never;
+	});
 	on("command.register", (_, e) => ({ value: { command: e.name } }));
 	on("fs.exists", (_, e) => ({ value: e.path === "/bin/zsh" || e.path === "/bin/bash" || (options.exists ?? []).includes(e.path) }));
 	on("fs.write", (_, e) => {
@@ -100,6 +108,8 @@ function world(on: On, options: WorldOptions = {}): World {
 	});
 	on("fs.stat", (_, e) => {
 		if (options.hasBusybox !== false && e.path === BUSYBOX) return { value: { kind: "file" as const, size: 1_800_000, mtimeMs: 0, isLink: false } };
+		const onDisk = options.disk?.[e.path];
+		if (onDisk !== undefined) return { value: { kind: "file" as const, size: onDisk.length, mtimeMs: 0, isLink: false } };
 		const age = runs.get(e.path.slice(e.path.lastIndexOf("/") + 1));
 		if (age !== undefined && e.path.startsWith(`${RUN_ROOT}/`)) {
 			return { value: { kind: "dir" as const, size: 0, mtimeMs: Date.now() - age * 60_000, isLink: false } };
@@ -119,7 +129,8 @@ function world(on: On, options: WorldOptions = {}): World {
 		}
 		if (argv[1] === "log" && argv.includes("--summary") && options.summary !== undefined) return done(options.summary);
 		if (argv[0] === "ls" && argv[2] === RUN_ROOT && options.runs) return done(`${[...runs.keys()].join("\n")}\n`);
-		if (argv[0] === "chmod" || argv[0] === "rm") return done();
+		if (argv[0] === "ps" && options.ps) return done(options.ps());
+		if (argv[0] === "chmod" || argv[0] === "rm" || argv[0] === "kill") return done();
 		if (argv[0] === "uname" && options.uname !== undefined) return done(`${options.uname}\n`);
 		// Anything else here is a command that failed.
 		return done("", 1);
@@ -161,10 +172,11 @@ test("an allowed call is re-issued inside the wrapper, and the original never ru
 	expect(issued.timeout).toBe(125_000);
 	expect(issued.description).toBe("Run tests");
 
-	// The model reads the timeline, the digest, and no housekeeping.
+	// The model reads the timeline, the digest, and no housekeeping: a header with only
+	// what says something, each offset to the millisecond, the notes after their marker.
 	const stdout = stdoutOf(ran);
-	expect(stdout).toMatch(/\[ {3}8\.421000 err\] warning: slow/);
-	expect(stdout).toMatch(/\ntiming: 8\.42s total, 3 lines, output from 0\.02s, stderr from 8\.42s, longest pause 6\.10s/);
+	expect(stdout).toMatch(/^run=R12 exit_code=0 duration_ms=8421\n\[0\.020 out\] collecting\n\[2\.320 out\] collected\n\[8\.421 err\] warning: slow\n--- pi-time ---\ntiming: 8\.42s total, 3 lines, output from 0\.02s, stderr from 8\.42s, longest pause 6\.10s/);
+	expect(stdout).not.toMatch(/timed_out=false|timeline_lines=|--- timeline ---/);
 	expect(stdout).not.toMatch(/pruned=/);
 });
 
@@ -182,7 +194,7 @@ test("a failed command stays a failure, with the host's own text and Pi-Time's n
 	const ran = await $.tool.run({ tool: "Bash", tool_use_id: "t1", command: "ls missing | head -3" });
 	expect(ran.result).toBe(undefined);
 	expect(ran.deny).toMatch(/^Exit code 1\nrun=R13 exit_code=1/);
-	expect(ran.deny).toMatch(/\[ {3}0\.030000 err\] no such file/);
+	expect(ran.deny).toMatch(/\n\[0\.030 err\] no such file\n--- pi-time ---\n/);
 	// What the command hid from its own result is stated after it.
 	expect(ran.deny).toMatch(/pipeline ends in `head`: the exit_code shown is `head`'s/);
 	expect(ran.deny).not.toMatch(/pruned=/);
@@ -267,7 +279,7 @@ test("the options reach the wrapper: view, terminal, deadline, cd", { options: {
 	// No carry: nothing leaves its directory behind and the outer shell never moves. The
 	// trap that is left reports how the command ended, and only that.
 	expect(issued.command).not.toMatch(/PITIME_CWD_FILE|cd -- /);
-	expect(issued.command).toMatch(/trap '\\''__pt_ps="\$\{pipestatus\[\*\]\}"; printf [^\n]* >"\$PITIME_FACTS_FILE" 2>\/dev\/null'\\'' EXIT; cd build && make'/);
+	expect(issued.command).toMatch(/trap '\\''\{ __pt_ps="\$\{pipestatus\[\*\]\}"; \} 2>\/dev\/null; printf [^\n]* >"\$PITIME_FACTS_FILE" 2>\/dev\/null'\\'' EXIT; cd build && make'/);
 });
 
 test("without the carry, a cd is named as call-local on the result", { options: { carryCwd: false } }, async ($, on) => {
@@ -288,7 +300,7 @@ test("a sandbox that refuses a terminal gets the same command on plain pipes, on
 	expect(seen.issued[0]?.command).toMatch(/--pty-split/);
 	expect(seen.issued[1]?.command).not.toMatch(/--pty/);
 	expect(seen.passed).toHaveLength(0);
-	expect(stdoutOf(ran)).toMatch(/\[ {3}0\.020000 out\] collecting/);
+	expect(stdoutOf(ran)).toMatch(/\[0\.020 out\] collecting/);
 
 	// The rest of the session does not pay for the failed attempt again…
 	await $.tool.run({ tool: "Bash", tool_use_id: "t2", command: "npm test" });
@@ -492,7 +504,7 @@ test("/sh runs the person's command through the capture and splits the two reade
 	expect(ran.isTextDisplayOnly).toBe(true);
 	const context = ran.context?.join("\n") ?? "";
 	expect(context).toMatch(/<bash-input>make test<\/bash-input>/);
-	expect(context).toMatch(/\[ {3}8\.421000 err\] warning: slow/);
+	expect(context).toMatch(/\[8\.421 err\] warning: slow/);
 	expect(context).toMatch(/\ntiming: 8\.42s total/);
 	expect(context).not.toMatch(/pruned=/);
 });
@@ -598,8 +610,8 @@ test("every wrapped command is handed the variables that switch buffering off, a
 	}
 	expect((await slash($, "status")).text).toMatch(/- buffering: switched off for Python, Ruby, Perl, Lua and every C-stdio program \(`STDBUF1=L`: grep, sed, awk, jq, compiled C and Swift\)/);
 	const text = await section($);
-	expect(text).toMatch(/buffering is switched off through the environment for Python, Ruby, Perl, Lua and every C-stdio program \(`grep`, `sed`, `awk`, `cut`, `jq`, compiled C and Swift\)/);
-	expect(text).toMatch(/a log file can be read while its writer runs\. The price is bulk output: .* prefix that one command with `STDBUF1=F`\./);
+	expect(text).toMatch(/buffering is switched off for Python, Ruby, Perl, Lua and C-stdio programs \(`grep`, `sed`, `awk`, `jq`, compiled C\), so lines still arrive when written/);
+	expect(text).toMatch(/so lines still arrive when written; for millions of lines prefix the command with `STDBUF1=F`\./);
 });
 
 test("on Linux the model is told what still writes in blocks, and which flag fixes it", async ($, on) => {
@@ -610,8 +622,8 @@ test("on Linux the model is told what still writes in blocks, and which flag fix
 	expect(String(seen.issued[0]?.command)).not.toMatch(/LD_PRELOAD|_STDBUF_O/);
 	expect((await slash($, "status")).text).toMatch(/- buffering: switched off for Python, Ruby, Perl, Lua; C-stdio programs \(grep, sed, awk, compiled C\) on a pipe still write in blocks here — the `preloadStdbuf` option/);
 	const text = await section($);
-	expect(text).toMatch(/switched off through the environment for Python, Ruby, Perl and Lua; Node, Go, Rust, Java and PHP never hold lines back/);
-	expect(text).toMatch(/A C-stdio program \(`grep`, `sed`, `awk`, `cut`, `jq`, compiled C\) whose stdout is a pipe or a file still writes in blocks, .* use `grep --line-buffered`, `sed -u` or `stdbuf -oL cmd`\./);
+	expect(text).toMatch(/buffering is switched off for Python, Ruby, Perl and Lua\. A C-stdio program \(`grep`, `sed`, `awk`, compiled C\) there still writes in blocks/);
+	expect(text).toMatch(/A C-stdio program \(`grep`, `sed`, `awk`, compiled C\) there still writes in blocks, .* use `grep --line-buffered`, `sed -u` or `stdbuf -oL cmd`\./);
 	expect(text).not.toMatch(/STDBUF1/);
 });
 
@@ -621,7 +633,7 @@ test("the stdbuf preload is used on Linux only when asked for and found", { opti
 	await $.tool.run({ tool: "Bash", tool_use_id: "t1", command: "make | grep warning" });
 	expect(String(seen.issued[0]?.command).includes('--env "LD_PRELOAD=${LD_PRELOAD:+$LD_PRELOAD:}/usr/lib/aarch64-linux-gnu/coreutils/libstdbuf.so" --env _STDBUF_O=L ')).toBe(true);
 	expect((await slash($, "status")).text).toMatch(/and dynamically linked C-stdio programs, through `LD_PRELOAD` of `\/usr\/lib\/aarch64-linux-gnu\/coreutils\/libstdbuf\.so`/);
-	expect(await section($)).toMatch(/through `stdbuf`'s preload, every dynamically linked C-stdio program .* prefix that one command with `_STDBUF_O=65536`\./);
+	expect(await section($)).toMatch(/Lua and dynamically linked C-stdio programs .* prefix the command with `_STDBUF_O=65536`\./);
 });
 
 test("asked for a preload where there is no library, nothing is preloaded and status says so", { options: { preloadStdbuf: true } }, async ($, on) => {
@@ -641,7 +653,7 @@ test("with unbuffer off no program's buffering is touched, and the model is told
 	expect(command).toMatch(/ --env TERM=dumb /);
 	expect(Object.keys(seen.files).some((path) => /pitime-unbuffer|PiTimeUnbuffer/.test(path))).toBe(false);
 	expect((await slash($, "status")).text).toMatch(/- buffering: left to each program \(`unbuffer` is off\)/);
-	expect(await section($)).toMatch(/Output buffering is left to each program: one whose stdout is a pipe or a file .* may hold its lines/);
+	expect(await section($)).toMatch(/Output buffering is left to each program: one writing into a pipe or a file may hold its lines/);
 });
 
 test("a data folder with a space gets no prelude: neither variable could carry its path", async ($, on) => {
@@ -670,7 +682,7 @@ test("the model is told that a `!` command is outside the capture and `/sh` is i
 	on("prompt.compose", () => ({ sections: [] }));
 	const composed = await $.prompt.compose({ model: "m", promptModel: "m", surfaces: [], outputStyle: null, traits: [], tools: ["Bash"] });
 	expect(composed.sections[0]?.text).toMatch(/types with `!` does not go through the capture/);
-	expect(composed.sections[0]?.text).toMatch(/runs with `\/sh` does go through it/);
+	expect(composed.sections[0]?.text).toMatch(/One run with `\/sh` does, and arrives as a timeline/);
 });
 
 test("/sh runs only for the person: a line that arrives any other way is refused", async ($, on) => {
@@ -772,7 +784,7 @@ test("a `!` command's stored result gets the digest and notes a tool result gets
 	await $.session.append(row(`<bash-stdout>${OK}</bash-stdout><bash-stderr></bash-stderr>`));
 	const stored = JSON.stringify(kept.appended());
 	expect(stored).toMatch(/<bash-input>make test \| tail -3<\/bash-input>/);
-	expect(stored).toMatch(/\[ {3}8\.421000 err\] warning: slow\\ntiming: 8\.42s total/);
+	expect(stored).toMatch(/\[8\.421 err\] warning: slow\\n--- pi-time ---\\ntiming: 8\.42s total/);
 	expect(stored).toMatch(/pipeline ends in `tail`/);
 	expect(stored).not.toMatch(/pruned=/);
 	expect(stored).toMatch(/<\/bash-stdout><bash-stderr><\/bash-stderr>/);
@@ -867,7 +879,8 @@ test("a pipeline whose stages all exited 0 earns no note at all", async ($, on) 
 	world(on, { inner: ranWith(QUICK, "pitime_facts ps=[0 0] dir=/tmp/t/busybox-run/R20") });
 	const ran = await $.tool.run({ tool: "Bash", tool_use_id: "t1", command: "ls | head -3" });
 	// Without the facts every `| head` call carried two lines about a status that was fine.
-	expect(stdoutOf(ran)).toBe(QUICK);
+	// With nothing to add, a short command costs one header line and its own output.
+	expect(stdoutOf(ran)).toBe("run=R20 exit_code=0 duration_ms=30\n[0.030 out] 1");
 });
 
 test("with no facts from the guest the old caveat stands, in full once and in a few words after", async ($, on) => {
@@ -920,8 +933,10 @@ test("a truncated view's pointer names the lines that are missing, not the ones 
 	const stdout = stdoutOf(ran);
 	// The view keeps the head and the tail: "head only … read the end" sent the model to
 	// lines it already had.
-	expect(stdout).toMatch(/\ntruncated: 5 of 762 lines shown — the first 3 and the last 2\. Lines 4-760 are omitted, 40 of them on stderr \(\/home\/t\/\.pi\/agent\/bin\/busybox log R30 --stream stderr shows those alone\)\./);
-	expect(stdout).toMatch(/read part of the gap with \/home\/t\/\.pi\/agent\/bin\/busybox log R30 --stream timeline --lines 4:43, or find a literal anywhere in it with/);
+	expect(stdout).toMatch(/\n--- pi-time ---\ntruncated: 5 of 762 lines shown — the first 3 and the last 2\. Lines 4-760 are omitted, 40 of them on stderr\./);
+	expect(stdout).toMatch(/\/home\/t\/\.pi\/agent\/bin\/busybox log R30 --stream timeline --lines 4:43 reads part of the gap; with --match STR in place of --stream and --lines it finds a literal anywhere, and with --stream stderr alone it shows the stderr lines/);
+	// The counts stay in the header when the view was cut, and only then.
+	expect(stdout).toMatch(/^run=R30 exit_code=0 duration_ms=900\ntimeline_lines=762 shown=5 truncated=true\n\[0\.010 out\] line 1\n/);
 	expect(stdout).not.toMatch(/head only/);
 	// Run ids are counters per root: the summary is asked of the root this run reported.
 	expect(seen.ran).toContainEqual([BUSYBOX, "log", "-D", "/sandbox/tmp/busybox-run", "R30", "--summary"]);
@@ -939,22 +954,23 @@ test("a command that prints the words `truncated=true` has not been truncated", 
 	const stdout = "run=R31 exit_code=0 timed_out=false cancelled=false idle=false duration_ms=20\ntimeline_lines=2 shown=2 truncated=false\n--- timeline ---\n[0.010000000 out] a view marked `truncated=true` shows\n[0.011000000 out] timeline_lines=9 shown=1 truncated=true";
 	world(on, { inner: ranWith(stdout) });
 	const ran = await $.tool.run({ tool: "Bash", tool_use_id: "t1", command: "git diff" });
-	expect(stdoutOf(ran)).toBe(stdout);
+	// No pointer, no notes: only the header and the stamps are respelled.
+	expect(stdoutOf(ran)).toBe("run=R31 exit_code=0 duration_ms=20\n[0.010 out] a view marked `truncated=true` shows\n[0.011 out] timeline_lines=9 shown=1 truncated=true");
 });
 
-test("an offset is printed once per burst, and in full again when the option says so", async ($, on) => {
+test("a stamp starts a burst and the lines under it carry none; the cut ends a burst", async ($, on) => {
 	world(on, { inner: ranWith(CUT) });
 	const stdout = stdoutOf(await $.tool.run({ tool: "Bash", tool_use_id: "t1", command: "make -j8" }));
-	expect(stdout).toMatch(/\n\[0\.010000000 out\] line 1\n\[= out\] line 2\n\[0\.011000000 err\] warning: early\n/);
+	expect(stdout).toMatch(/\n\[0\.010 out\] line 1\nline 2\n\[0\.011 err\] warning: early\n/);
 	// The cut ends a burst: the first line after it carries its own offset again.
-	expect(stdout).toMatch(/\] \.\.\.\n\[0\.890000000 out\] line 761\n\[= out\] line 762\n/);
+	expect(stdout).toMatch(/\] \.\.\.\n\[0\.890 out\] line 761\nline 762\n/);
 });
 
-test("with compactStamps off every line keeps its digits", { options: { compactStamps: false } }, async ($, on) => {
+test("with compactStamps off every line keeps a stamp", { options: { compactStamps: false } }, async ($, on) => {
 	world(on, { inner: ranWith(CUT) });
 	const stdout = stdoutOf(await $.tool.run({ tool: "Bash", tool_use_id: "t1", command: "make -j8" }));
-	expect(stdout).not.toMatch(/\[= /);
-	expect(stdout).toMatch(/\n\[0\.010000000 out\] line 2\n/);
+	expect(stdout).toMatch(/\n\[0\.010 out\] line 1\n\[0\.010 out\] line 2\n/);
+	expect(stdout).toMatch(/\n\[0\.890 out\] line 762\n/);
 });
 
 test("the person's row is the same lines either way: `[= out]` is decoration too", async ($, on) => {
@@ -970,7 +986,7 @@ test("the person's row is the same lines either way: `[= out]` is decoration too
 	const drawn = (drawnFrom as { stdout: string }).stdout;
 	// The cut between head and tail is the one line of the wrapper's a person needs.
 	expect(drawn).toMatch(/^line 1\nline 2\nwarning: early\n\.\.\. \[timeline truncated: 5 of 762 lines shown \(757 omitted\)[^\n]*\nline 761\nline 762\n/);
-	expect(drawn).not.toMatch(/\[= out\]|0\.010000000/);
+	expect(drawn).not.toMatch(/\[= out\]|0\.010|pi-time/);
 	await ui.unmount();
 });
 
@@ -1053,17 +1069,17 @@ test("the self-test is one wrapped echo with the flags a command gets, and its l
 	expect(seen.ran).toContainEqual([BUSYBOX, "run", "--timestamps", "--stamp-ns", "--max-bytes", "4000", "--timeout", "10", "--idle-timeout", "10", "--", "/bin/sh", "-c", "echo pi-time-probe"]);
 	const text = composed.sections[0]?.text ?? "";
 	// The example header and stamps are cut from what this build printed.
-	expect(text).toMatch(/opens with `run=R12 exit_code=0 timed_out=false cancelled=false idle=false duration_ms=328`/);
-	expect(text).toMatch(/`\[0\.012345678 out\] text` or `\[0\.012349012 err\] text`/);
-	expect(text).toMatch(/carries `\[= out\]` or `\[= err\]` instead of the digits again/);
+	expect(text).toMatch(/opens with `run=R12 exit_code=0 duration_ms=328`, then `\[0\.012 out\] text` starts a burst/);
+	expect(text).toMatch(/Lines under it with no stamp arrived at that same offset on that same stream/);
 });
 
-test("an older build's prompt quotes the older shape, because that is what its results look like", async ($, on) => {
+test("an older build's prompt quotes what its results will look like once respelled", async ($, on) => {
 	world(on);
 	on("prompt.compose", () => ({ sections: [] }));
 	const text = (await $.prompt.compose({ model: "m", promptModel: "m", surfaces: [], outputStyle: null, traits: [], tools: ["Bash"] })).sections[0]?.text ?? "";
-	expect(text).toMatch(/`\[ {3}0\.012345 out\] text` or `\[ {3}0\.012349 err\] text`/);
-	expect(text).toMatch(/opens with `run=R12 exit_code=0 timed_out=false cancelled=false duration_ms=328`/);
+	// Padded or not, six digits or nine: what the model is shown is what a result will
+	// look like once the hook has respelled it, which is the same for every build.
+	expect(text).toMatch(/opens with `run=R12 exit_code=0 duration_ms=328`, then `\[0\.012 out\] text` starts a burst/);
 });
 
 /** 205 run folders, newest first: the first 200 are kept whatever their age. */
@@ -1090,4 +1106,184 @@ test("under the count nothing is removed, however old", async ($, on) => {
 	await new Promise((resolve) => setTimeout(resolve, 20));
 	expect(seen.ran.filter((argv) => argv[0] === "rm")).toHaveLength(0);
 	expect((await slash($)).text).toMatch(/- captures: kept in `\/tmp\/t\/busybox-run` for `busybox log` — at least 2 hours, and the newest 200 for longer \(0 removed by this session\)/);
+});
+
+
+// =============================================================================
+// 0.7.0: a running command is watched — its output, and its processor
+// =============================================================================
+
+const RUN_DIR = `${RUN_ROOT}/R50`;
+const LIVE_FILE = "/data/live/t1";
+const TOOL_ROW = { plugin: "managed-tools", component: "ToolUse", requestId: "t1" } as const;
+
+/** A command that is still running: the test ends it, with whatever result it chooses. */
+function held() {
+	let finish: (value: unknown) => void = () => undefined;
+	const pending = new Promise<unknown>((resolve) => {
+		finish = resolve;
+	});
+	return { inner: () => pending, finish };
+}
+
+/** `ps -A -o pgid=,time=` for the command's group (4242) at a CPU time in seconds, among others. */
+function psAt(seconds: number): string {
+	return `    1  10:02.48\n 4242   0:${seconds.toFixed(2).padStart(5, "0")}\n  359   0:00.33\n`;
+}
+
+test("the command is told where to report itself, and the applet's own silence limit is left out", async ($, on) => {
+	mock.clock(on);
+	const seen = world(on, { features: ["stamp-ns", "idle-timeout"] });
+	await $.tool.run({ tool: "Bash", tool_use_id: "t1", command: "make -j8" });
+	const issued = (seen.issued[0] as { command: string }).command;
+	expect(issued).toMatch(/ --env 'PITIME_LIVE_FILE=\/data\/live\/t1' /);
+	expect(issued).toMatch(/-c 'exec <\/dev\/null; \{ printf [^;]+ >"\$PITIME_LIVE_FILE"; \} 2>\/dev\/null; trap /);
+	// Watched from here, by output and processor both: the applet's limit knows only silence.
+	expect(issued).not.toMatch(/--idle-timeout/);
+	expect(issued).toMatch(/--timeout 120 /);
+	expect(issued).toMatch(/ '\/data\/live\/t1'; \(exit "\$__pt_rc"\)$/);
+});
+
+test("with live off nothing is watched, and the applet's silence limit stands", { options: { live: false } }, async ($, on) => {
+	mock.clock(on);
+	const seen = world(on, { features: ["stamp-ns", "idle-timeout"] });
+	await $.tool.run({ tool: "Bash", tool_use_id: "t1", command: "make -j8" });
+	const issued = (seen.issued[0] as { command: string }).command;
+	expect(issued).not.toMatch(/PITIME_LIVE_FILE/);
+	expect(issued).toMatch(/--timeout 120 --idle-timeout 120 /);
+});
+
+test("a running command shows its newest lines and a sign of life under its row", async ($, on) => {
+	const clock = mock.clock(on);
+	const disk: Record<string, string> = {};
+	let cpu = 0;
+	const run = held();
+	world(on, { disk, ps: () => psAt(cpu), inner: run.inner });
+	on("ui.render", ($, e) => {
+		const { Text } = $.ui.resolve(e);
+		return (<Text>Bash(make -j8)</Text>) as never;
+	});
+	const pending = $.tool.run({ tool: "Bash", tool_use_id: "t1", command: "make -j8" });
+	// Nothing is read for the first moment: most commands are over by then.
+	await clock.advance(1000);
+	const props = { tool_use_id: "t1", tool: "Bash", input: { command: "make -j8" }, isRunning: true, isErrored: false, isInterrupted: false };
+	const early = await $.ui.mount({ ...TOOL_ROW, surface: "terminal", props });
+	expect(await early.find({ type: "Text", text: /running/ })).toBe(undefined);
+	await early.unmount();
+
+	// The command has reported itself and printed two lines; the processor is busy.
+	disk[LIVE_FILE] = `${RUN_DIR}\n4242\n`;
+	disk[`${RUN_DIR}/stdout`] = "cc -c src/a.c\r\ncc -c src/b.c\r\n";
+	disk[`${RUN_DIR}/stderr`] = "";
+	await clock.advance(600);
+	cpu = 3;
+	await clock.advance(3000);
+	const ui = await $.ui.mount({ ...TOOL_ROW, surface: "terminal", props });
+	const shown = (await ui.find({ type: "Text", text: /running/ }))?.text ?? "";
+	expect(shown).toBe("  ⎿  cc -c src/a.c\n     cc -c src/b.c\n     running 5s · last output 3s ago · CPU busy (100% of a processor): working");
+	// The engine's own row is kept above it.
+	expect((await ui.find({ type: "Text", text: /Bash\(make/ }))?.text).toBe("Bash(make -j8)");
+	await ui.unmount();
+
+	// More output, and a warning on stderr: the view follows the capture.
+	disk[`${RUN_DIR}/stdout`] += "ld: linking\r\n";
+	disk[`${RUN_DIR}/stderr`] = "warning: unused variable\n";
+	await clock.advance(500);
+	const later = await $.ui.mount({ ...TOOL_ROW, surface: "terminal", props });
+	expect((await later.find({ type: "Text", text: /running/ }))?.text).toMatch(/cc -c src\/b\.c\n     ld: linking\n     warning: unused variable\n     running 5s · CPU busy/);
+	await later.unmount();
+
+	run.finish({ result: { stdout: OK, stderr: "", interrupted: false } });
+	const ran = await pending;
+	// The model is sent the result, and none of the live view.
+	expect(stdoutOf(ran as { result?: unknown })).not.toMatch(/running \d+s|CPU busy/);
+	// Once it has ended the row is the engine's alone again.
+	const done = await $.ui.mount({ ...TOOL_ROW, surface: "terminal", props: { ...props, isRunning: false } });
+	expect(await done.find({ type: "Text", text: /running/ })).toBe(undefined);
+	await done.unmount();
+});
+
+test("a command with no sign of life — no line, no processor — is stopped as stuck, and the result says why", { options: { idleSeconds: 20 } }, async ($, on) => {
+	const clock = mock.clock(on);
+	const disk: Record<string, string> = { [LIVE_FILE]: `${RUN_DIR}\n4242\n`, [`${RUN_DIR}/stdout`]: "Password: ", [`${RUN_DIR}/stderr`]: "" };
+	const run = held();
+	// The processor time never moves: the command is waiting.
+	const seen = world(on, { disk, ps: () => psAt(0.02), inner: run.inner });
+	const pending = $.tool.run({ tool: "Bash", tool_use_id: "t1", command: "sudo make install", timeout: 600_000 });
+	await clock.advance(19_000);
+	expect(seen.ran.filter((argv) => argv[0] === "kill")).toHaveLength(0);
+	await clock.advance(4000);
+	// Its whole group, and only a group that `ps` had just listed.
+	expect(seen.ran.filter((argv) => argv[0] === "kill")).toEqual([["kill", "-TERM", "--", "-4242"]]);
+	// Asked once. A command that ignores the request is not left running behind a result
+	// that says it was stopped: three seconds on, the group is killed outright.
+	await clock.advance(3100);
+	expect(seen.ran.filter((argv) => argv[0] === "kill")).toEqual([["kill", "-TERM", "--", "-4242"], ["kill", "-KILL", "--", "-4242"]]);
+	// The run reports a signal, since that is all it saw; the hooks module knows more.
+	const text = "Exit code 1\nrun=R50 exit_code=-1 timed_out=false cancelled=false idle=false duration_ms=22100\ntimeline_lines=1 shown=1 truncated=false\n--- timeline ---\n[0.010000000 out] Password: ";
+	run.finish({ isError: true, result: text, text });
+	const ran = (await pending) as { deny?: string };
+	expect(ran.deny).toMatch(/^IDLE — not a failure of the command and not its deadline: for 2\ds it printed nothing and used no processor time to speak of \(0\.0s\), so it was waiting, not working, and was stopped as stuck\./);
+	expect(ran.deny).not.toMatch(/KILLED/);
+	expect(ran.deny).toMatch(/\nExit code 1\nrun=R50 exit_code=-1 duration_ms=22100\n\[0\.010 out\] Password: /);
+	expect((await slash($)).text).toMatch(/\(1 stopped this session\)/);
+});
+
+test("a command that is silent and working is left alone, and its deadline says it was working", { options: { idleSeconds: 20 } }, async ($, on) => {
+	const clock = mock.clock(on);
+	const disk: Record<string, string> = { [LIVE_FILE]: `${RUN_DIR}\n4242\n`, [`${RUN_DIR}/stdout`]: "compiling\r\n", [`${RUN_DIR}/stderr`]: "" };
+	const run = held();
+	let cpu = 0;
+	const seen = world(on, { disk, ps: () => psAt(cpu), inner: run.inner });
+	const pending = $.tool.run({ tool: "Bash", tool_use_id: "t1", command: "cargo build --release" });
+	// A whole processor, the whole time, and not a line after the first.
+	for (let second = 0; second < 59; second++) {
+		cpu += 1;
+		await clock.advance(1000);
+	}
+	// Three times the silence limit has passed.
+	expect(seen.ran.filter((argv) => argv[0] === "kill")).toHaveLength(0);
+	const text = "Exit code 3\nrun=R50 exit_code=-1 timed_out=true cancelled=false idle=false duration_ms=59020\ntimeline_lines=1 shown=1 truncated=false\n--- timeline ---\n[0.300000000 out] compiling";
+	run.finish({ isError: true, result: text, text });
+	const ran = (await pending) as { deny?: string };
+	expect(ran.deny).toMatch(/^TIMEOUT — not a failure of the command/);
+	expect(ran.deny).toMatch(/\nCPU: it used 5\d\.\ds of processor time in 59s and was still computing when it was stopped, so it was working, not stuck: more time \(or `run_in_background`\) is what it needs\.\n/);
+});
+
+test("a command that cannot report itself is not watched again: such calls get the applet's own limit", async ($, on) => {
+	const clock = mock.clock(on);
+	const first = held();
+	let calls = 0;
+	// Nothing ever appears on disk: a sandbox that cannot write the report.
+	const seen = world(on, { features: ["stamp-ns", "idle-timeout"], disk: {}, inner: () => (calls++ === 0 ? first.inner() : { result: { stdout: OK, stderr: "", interrupted: false } }) });
+	on("prompt.compose", () => ({ sections: [] }));
+	const compose = () => $.prompt.compose({ model: "m", promptModel: "m", surfaces: [], outputStyle: null, traits: [], tools: ["Bash"] });
+	// While commands can be watched, the model is told what "stuck" means here.
+	expect((await compose()).sections[0]?.text).toMatch(/a command that neither prints nor uses the processor for 120s is stopped as stuck whatever its `timeout`/);
+	const pending = $.tool.run({ tool: "Bash", tool_use_id: "t1", command: "make" });
+	await clock.advance(8000);
+	first.finish({ result: { stdout: OK, stderr: "", interrupted: false } });
+	await pending;
+	await $.tool.run({ tool: "Bash", tool_use_id: "t2", command: "make test" });
+	const [watched, unwatched] = seen.issued.map((call) => (call as { command: string }).command);
+	expect(watched).toMatch(/PITIME_LIVE_FILE/);
+	expect(watched).not.toMatch(/--idle-timeout/);
+	expect(unwatched).not.toMatch(/PITIME_LIVE_FILE/);
+	expect(unwatched).toMatch(/--idle-timeout 120 /);
+	// And the model is told the truth about it from then on.
+	expect((await compose()).sections[0]?.text).toMatch(/a command that prints nothing for 120s is stopped whatever its `timeout`/);
+	expect((await slash($)).text).toMatch(/not for sandboxed commands here, which cannot report themselves and are judged by silence alone/);
+});
+
+test("nothing is signalled that `ps` did not just list", { options: { idleSeconds: 20 } }, async ($, on) => {
+	const clock = mock.clock(on);
+	const disk: Record<string, string> = { [LIVE_FILE]: `${RUN_DIR}\n4242\n`, [`${RUN_DIR}/stdout`]: "", [`${RUN_DIR}/stderr`]: "" };
+	const run = held();
+	// The group the command named is not among the processes: it has gone, or the file is stale.
+	const seen = world(on, { disk, ps: () => "    1  10:02.48\n  359   0:00.33\n", inner: run.inner });
+	const pending = $.tool.run({ tool: "Bash", tool_use_id: "t1", command: "make" });
+	await clock.advance(60_000);
+	expect(seen.ran.filter((argv) => argv[0] === "kill")).toHaveLength(0);
+	run.finish({ result: { stdout: OK, stderr: "", interrupted: false } });
+	await pending;
 });

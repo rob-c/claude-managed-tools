@@ -1,6 +1,6 @@
 {
 	"name": "managed-tools",
-	"version": "0.5.0",
+	"version": "0.7.0",
 	"description": "Pi-Time for Claude Code: every Bash result comes back as a timeline — which stream each line arrived on, when, and a named TIMEOUT instead of a hang.",
 	"author": {
 		"name": "Robert Currie",
@@ -42,9 +42,15 @@
 		},
 		"idleSeconds": {
 			"type": "number",
-			"title": "Stop a silent command after (seconds)",
-			"description": "Stop a command that prints nothing on either stream for this long, whatever its deadline, and return it as a named IDLE with what it printed. It matters when a call raises its timeout: a command given ten minutes that hangs at once comes back after this long instead. A command that is quiet and working is stopped too (a silent compile, a sleep); 0 turns the limit off, and /pi-time idle <seconds|off> changes it for one session. Needs busybox-static 0.6.0 or later.",
+			"title": "Stop a command with no sign of life after (seconds)",
+			"description": "Stop a command that shows no sign of life for this long, whatever its deadline, and return it as a named IDLE with what it printed. A sign of life is a line on either stream or processor time: a compiler that prints nothing while it works is left alone, and a command blocked on a lock or a prompt is stopped. It matters when a call raises its timeout: a command given ten minutes that hangs at once comes back after this long instead. A command that is meant to wait (a sleep, a server) is stopped too and belongs in the background. 0 turns the limit off, and /pi-time idle <seconds|off> changes it for one session. Where a command cannot be watched (Claude Code's sandbox, your own ! and /sh commands) silence alone decides.",
 			"default": 120
+		},
+		"live": {
+			"type": "boolean",
+			"title": "Show a running command's output and a sign of life",
+			"description": "While a command runs, draw its newest lines under its row and one line that says it is alive: how long it has run, how long since it printed, and whether the processor is working for it (read from ps for the command's own process group). The same watch is what lets a silent command that is working be told from one that is stuck. Nothing is read for the first second and a half, so a quick command pays nothing. Off shows nothing until a command ends, and silence alone then decides whether it is stuck.",
+			"default": true
 		},
 		"unbuffer": {
 			"type": "boolean",
@@ -66,9 +72,15 @@
 		},
 		"compactStamps": {
 			"type": "boolean",
-			"title": "Print an offset once per burst",
-			"description": "A line that arrived at the same offset as the line above it carries [= out] instead of the digits again. Output mostly arrives in bursts, where every line would repeat the same number; the stream tag stays on every line. Off prints the full offset on every line.",
+			"title": "One stamp per burst",
+			"description": "A line that arrived at the same offset and on the same stream as the line above it carries no stamp: a stamp starts a burst, and the lines under it belong to it. Every change of stream is still marked. Output mostly arrives in bursts, and a stamp costs the model about ten tokens a line; off puts one on every line again.",
 			"default": true
+		},
+		"stampDigits": {
+			"type": "number",
+			"title": "Decimals in an offset",
+			"description": "How many decimals of an offset the model is shown, 1 to 9: 3 is milliseconds, 9 is the nanoseconds the capture keeps. Digits are expensive to a model and the order of lines is already their order of arrival; the capture itself always keeps nanoseconds, and busybox log prints them.",
+			"default": 3
 		},
 		"guard": {
 			"type": "boolean",

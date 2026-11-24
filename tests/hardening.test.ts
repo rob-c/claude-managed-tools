@@ -22,7 +22,7 @@ import {
 } from "../src/busybox";
 import { hasTimeline, stripTimeline } from "../src/display";
 import { describePipestatus, detectEndless, endlessReason, maskQuotes, resultNotes, takeFacts } from "../src/guard";
-import { compactStamps, outcomeNotice, parseHeader, parseTimeline, summarizeTiming, truncationHint } from "../src/timing";
+import { compactStamps, expandStamps, NOTES_MARKER, outcomeNotice, parseHeader, slimHeader, truncationHint } from "../src/timing";
 import { exitTrap, wrapCommand } from "../src/wrap";
 
 const HEADER = "run=R30 exit_code=0 timed_out=false cancelled=false idle=false duration_ms=900";
@@ -75,15 +75,21 @@ describe("the pointer into a truncated view", () => {
 	test("names the omitted range and reads from inside it", () => {
 		const hint = truncationHint(view, "/b/busybox") ?? "";
 		expect(hint).toMatch(/^truncated: 5 of 762 lines shown — the first 3 and the last 2\. Lines 4-760 are omitted/);
-		expect(hint).toMatch(/\/b\/busybox log R30 --stream timeline --lines 4:43/);
+		expect(hint).toMatch(/\/b\/busybox log R30 --stream timeline --lines 4:43 reads part of the gap; with --match STR in place of --stream and --lines it finds a literal anywhere$/);
 		expect(hint).not.toMatch(/head only|read the end/);
+		// The binary's path is long and used to be said three times in this one line.
+		expect(hint.split("/b/busybox")).toHaveLength(2);
 	});
 
 	test("says how many of the missing lines are on stderr, when that could be asked", () => {
 		// Unknown: said as unknown, not as none.
 		expect(truncationHint(view, "/b/busybox")).toMatch(/omitted, it may hold stderr lines this view does not show\./);
 		// One stderr line is on screen, so 41 in all leaves 40 unseen.
-		expect(truncationHint(view, "/b/busybox", { stderrTotal: 41 })).toMatch(/omitted, 40 of them on stderr \(\/b\/busybox log R30 --stream stderr shows those alone\)\./);
+		const some = truncationHint(view, "/b/busybox", { stderrTotal: 41 }) ?? "";
+		expect(some).toMatch(/omitted, 40 of them on stderr\./);
+		// How to see those alone is only said when there are some.
+		expect(some).toMatch(/, and with --stream stderr alone it shows the stderr lines$/);
+		expect(truncationHint(view, "/b/busybox", { stderrTotal: 1 })).not.toMatch(/--stream stderr/);
 		// The one that matters most: a view with no errors in the gap can say so.
 		expect(truncationHint(view, "/b/busybox", { stderrTotal: 1 })).toMatch(/omitted, none of them on stderr\./);
 	});
@@ -91,12 +97,14 @@ describe("the pointer into a truncated view", () => {
 	test("a short gap is not read past its end", () => {
 		const hint = truncationHint(cutView(head, tail, 12), "/b/busybox") ?? "";
 		expect(hint).toMatch(/Lines 4-10 are omitted/);
-		expect(hint).toMatch(/--lines 4:10,/);
+		expect(hint).toMatch(/--lines 4:10 reads part of the gap/);
 	});
 
-	test("the compacted spelling is counted the same way", () => {
-		const hint = truncationHint(compactStamps(view), "/b/busybox", { stderrTotal: 1 }) ?? "";
-		expect(hint).toMatch(/the first 3 and the last 2\. Lines 4-760 are omitted, none of them on stderr/);
+	test("the pointer is worked out on the capture as `run` printed it, before any line loses its stamp", () => {
+		// One stamp per burst leaves most lines bare, and a bare line cannot be counted.
+		// The hooks module therefore reads first and compacts last; this is why.
+		expect(truncationHint(view, "/b/busybox", { stderrTotal: 1 })).toMatch(/the first 3 and the last 2\. Lines 4-760 are omitted, none of them on stderr/);
+		expect(compactStamps(view).split("\n").filter((line) => /^\[/.test(line))).toHaveLength(3);
 	});
 
 	test("a build that keeps the head only is still sent to the end", () => {
@@ -108,37 +116,133 @@ describe("the pointer into a truncated view", () => {
 		const brief = "run=R2 exit_code=0 timed_out=false cancelled=false duration_ms=5\ncaptured_bytes=90000 capture_complete=true view_truncated=true\n--- stdout ---\nx";
 		const hint = truncationHint(brief, "/b/busybox") ?? "";
 		expect(hint).toMatch(/^truncated: the view was cut to its budget/);
-		expect(hint).toMatch(/\/b\/busybox log R2 --stream stdout --lines A:B/);
+		expect(hint).toMatch(/\/b\/busybox log R2 --stream stdout --lines A:B reads a stream/);
 		expect(hint).not.toMatch(/undefined|NaN| 0 of 0 /);
 	});
 });
 
-describe("an offset said once per burst", () => {
-	const lines = ["[0.010000000 out] a", "[0.010000000 out] b", "[0.010000000 err] c", "[0.250000000 out] d", "[0.250000000 out] e"];
-	const text = [HEADER, "timeline_lines=5 shown=5 truncated=false", "--- timeline ---", ...lines, "timing: 0.25s total"].join("\n");
+describe("each offset said once, and no more precisely than it is read", () => {
+	const lines = [
+		"[0.010000111 out] a",
+		"[0.010000999 out] b",
+		"[0.010500000 err] c",
+		"[0.010900000 err] d",
+		"[0.250000000 out] e",
+		"[0.250000000 out] [INFO] f",
+		"[0.250000000 out] timing: is what I print",
+		"[0.250000000 out] ",
+		"[0.250000000 out] g",
+	];
+	const text = [HEADER, "timeline_lines=9 shown=9 truncated=false", "--- timeline ---", ...lines].join("\n");
 
-	test("only the repeated digits go: the stream tag stays on every line", () => {
-		expect(compactStamps(text).split("\n").slice(3, 8)).toEqual(["[0.010000000 out] a", "[= out] b", "[= err] c", "[0.250000000 out] d", "[= out] e"]);
+	test("a stamp starts a burst, and the lines under it carry none", () => {
+		expect(compactStamps(text).split("\n").slice(3)).toEqual([
+			"[0.010 out] a",
+			"b",
+			// The same millisecond on the other stream: marked, so the change is never missed.
+			"[= err] c",
+			"d",
+			"[0.250 out] e",
+			// A line whose own text could be taken for a stamp or for the wrapper keeps a mark.
+			"[= out] [INFO] f",
+			"[= out] timing: is what I print",
+			"",
+			"g",
+		]);
 	});
 
-	test("it is lossless: every reader gives the same answer either way", () => {
-		const compact = compactStamps(text);
-		expect(parseTimeline(compact)).toEqual(parseTimeline(text));
-		expect(summarizeTiming(parseTimeline(compact), 1900)).toBe(summarizeTiming(parseTimeline(text), 1900));
-		expect(stripTimeline(compact)).toBe(stripTimeline(text));
-		expect(hasTimeline(compact)).toBe(true);
-		expect(compactStamps(compact)).toBe(compact);
+	test("offsets are cut to the digits asked for, never rounded up, and never padded", () => {
+		const one = (line: string, digits?: number) => compactStamps(line, { digits });
+		expect(one("[0.038778666 out] x")).toBe("[0.038 out] x");
+		// Cut, not rounded: an offset is never later than the event.
+		expect(one("[0.038999999 out] x")).toBe("[0.038 out] x");
+		expect(one("[0.038778666 out] x", 6)).toBe("[0.038778 out] x");
+		expect(one("[0.038778666 out] x", 9)).toBe("[0.038778666 out] x");
+		expect(one("[125.004211000 err] x")).toBe("[125.004 err] x");
+		// Every shape a build has printed comes out the same way.
+		expect(one("[   0.011354 out] x")).toBe("[0.011 out] x");
+		expect(one("[00000.005868042 out] x")).toBe("[0.005 out] x");
+		// A build that printed fewer digits than asked for keeps what it printed.
+		expect(one("[10.23 out] x")).toBe("[10.23 out] x");
 	});
 
-	test("anything that is not a timeline line ends the burst, and is left as it is", () => {
+	test("with bursts off every line keeps a stamp, still at the precision asked for", () => {
+		expect(compactStamps(text, { burst: false }).split("\n").slice(3, 6)).toEqual(["[0.010 out] a", "[0.010 out] b", "[0.010 err] c"]);
+		expect(compactStamps(text, { burst: false, digits: 9 }).split("\n").slice(3)).toEqual(lines);
+	});
+
+	test("it loses nothing but the decimals: every line can be given its stamp back", () => {
+		const millis = lines.map((line) => line.replace(/^\[(\d+\.\d{3})\d* /, "[$1 "));
+		expect(expandStamps(compactStamps(text)).split("\n").slice(3)).toEqual(millis);
+		// And the person's row is the same lines either way.
+		expect(stripTimeline(compactStamps(text))).toBe(stripTimeline(text));
+		expect(hasTimeline(compactStamps(slimHeader(text)))).toBe(true);
+		// Done twice it changes nothing more.
+		expect(compactStamps(compactStamps(text))).toBe(compactStamps(text));
+	});
+
+	test("anything that is not a timeline line ends the burst", () => {
 		const cut = compactStamps(cutView(["[0.5 out] a", "[0.5 out] b"], ["[0.5 out] y", "[0.5 out] z"], 900)).split("\n");
 		// After the cut the offset is said again, even though it is the same number.
-		expect(cut.slice(3)).toEqual(["[0.5 out] a", "[= out] b", cut[5] as string, "[0.5 out] y", "[= out] z"]);
+		expect(cut.slice(3)).toEqual(["[0.5 out] a", "b", cut[5] as string, "[0.5 out] y", "z"]);
 		expect(cut[5]).toMatch(/^\.\.\. \[timeline truncated/);
-		// Padded shapes compare by their number, not by their spaces.
-		expect(compactStamps("[   0.011354 out] a\n[   0.011354 out] b")).toBe("[   0.011354 out] a\n[= out] b");
-		// A command's own line that merely looks like the marker is never rewritten.
-		expect(compactStamps("[0.1 out] [= out] is what I print\n[0.1 out] [= out] twice")).toBe("[0.1 out] [= out] is what I print\n[= out] [= out] twice");
+		// So are the notes: nothing after them is given a stamp back.
+		const noted = `${compactStamps(text)}\n${NOTES_MARKER}\ntiming: 0.25s total\nexit_code is \`head\`'s, not the command's.`;
+		expect(expandStamps(noted).split("\n").slice(-3)).toEqual([NOTES_MARKER, "timing: 0.25s total", "exit_code is `head`'s, not the command's."]);
+	});
+});
+
+describe("the header, with only what says something", () => {
+	test("three lines become one when nothing happened but the command", () => {
+		const raw = "run=R12 exit_code=0 timed_out=false cancelled=false idle=false duration_ms=328\ntimeline_lines=3 shown=3 truncated=false stamp=ns res_ns=41\n--- timeline ---\n[0.011354208 out] ok 1";
+		expect(slimHeader(raw)).toBe("run=R12 exit_code=0 duration_ms=328\n[0.011354208 out] ok 1");
+		// A build before 0.6.0, whose header has no `idle=` field.
+		expect(slimHeader("run=R1 exit_code=4 timed_out=false cancelled=false duration_ms=7\ntimeline_lines=0 shown=0 truncated=false\n--- timeline ---")).toBe("run=R1 exit_code=4 duration_ms=7");
+	});
+
+	test("a flag is kept when it is true, and the counts when the view was cut", () => {
+		expect(slimHeader("run=R14 exit_code=-1 timed_out=true cancelled=false idle=false duration_ms=120019\ntimeline_lines=1 shown=1 truncated=false\n--- timeline ---\n[0.01 out] x")).toBe(
+			"run=R14 exit_code=-1 timed_out=true duration_ms=120019\n[0.01 out] x",
+		);
+		expect(slimHeader("run=R14 exit_code=-1 timed_out=false cancelled=false idle=true duration_ms=2025\ntimeline_lines=0 shown=0 truncated=false\n--- timeline ---")).toBe("run=R14 exit_code=-1 idle=true duration_ms=2025");
+		expect(slimHeader(cutView(["[0.5 out] a"], ["[0.5 out] z"], 900)).split("\n").slice(0, 3)).toEqual([
+			"run=R30 exit_code=0 duration_ms=900",
+			"timeline_lines=900 shown=2 truncated=true",
+			"[0.5 out] a",
+		]);
+	});
+
+	test("what stands before the header stays, and a result that is not a capture is left alone", () => {
+		expect(slimHeader(`TIMEOUT — not a failure\nExit code 3\n${HEADER}\ntimeline_lines=0 shown=0 truncated=false\n--- timeline ---`)).toBe("TIMEOUT — not a failure\nExit code 3\nrun=R30 exit_code=0 duration_ms=900");
+		expect(slimHeader("just output\nmore")).toBe("just output\nmore");
+	});
+
+	test("the sectioned view keeps its section markers and loses its two paths", () => {
+		const brief = [
+			"run=R2 exit_code=0 timed_out=false cancelled=false idle=false duration_ms=5",
+			"captured_bytes=17 stdout=17 stderr=0 capture_complete=true view_truncated=false",
+			"stdout_artifact=/var/folders/9z/T//busybox-run/R2/stdout",
+			"stderr_artifact=/var/folders/9z/T//busybox-run/R2/stderr",
+			"--- stdout ---",
+			"[brief] lines_in=1 records=1",
+			"hello",
+			"--- stderr ---",
+			"(empty)",
+		].join("\n");
+		expect(slimHeader(brief).split("\n")).toEqual(["run=R2 exit_code=0 duration_ms=5", "--- stdout ---", "[brief] lines_in=1 records=1", "hello", "--- stderr ---", "(empty)"]);
+		// A cut view keeps the line that says so.
+		expect(slimHeader(brief.replace("view_truncated=false", "view_truncated=true")).split("\n")[1]).toMatch(/^captured_bytes=17 .* view_truncated=true$/);
+	});
+
+	test("every reader still reads the one-line header", () => {
+		const slim = slimHeader("Exit code 3\nrun=R14 exit_code=-1 timed_out=true cancelled=false idle=false duration_ms=120019\ntimeline_lines=1 shown=1 truncated=false\n--- timeline ---\n[0.01 out] starting");
+		expect(parseHeader(slim)).toEqual({ runId: "R14", exitCode: -1, timedOut: true, cancelled: false, idle: false, durationMs: 120019, linesTotal: undefined, linesShown: undefined, truncated: false });
+		expect(hasTimeline(slim)).toBe(true);
+		expect(stripTimeline(slim)).toBe("Exit code 3\nstarting");
+		// A command with no output at all is still recognised as the wrapper's result.
+		expect(hasTimeline("run=R9 exit_code=0 duration_ms=3")).toBe(true);
+		expect(stripTimeline("run=R9 exit_code=0 duration_ms=3")).toBe("(no output)");
+		expect(hasTimeline("the run=R9 exit_code=0 duration_ms=3 was fine")).toBe(false);
 	});
 });
 
@@ -169,12 +273,12 @@ describe("how a run ended, said first and said truly", () => {
 describe("what the guest shell reports about how it ended", () => {
 	test("the trap reads the statuses first, in the spelling its shell has", () => {
 		// Measured: zsh keeps them in `pipestatus`; `${PIPESTATUS[*]}` is empty there.
-		expect(exitTrap("/bin/zsh", { report: true })).toMatch(/^trap '__pt_ps="\$\{pipestatus\[\*\]\}"; printf /);
-		expect(exitTrap("/opt/homebrew/bin/bash", { report: true })).toMatch(/^trap '__pt_ps="\$\{PIPESTATUS\[\*\]\}"; printf /);
+		expect(exitTrap("/bin/zsh", { report: true })).toMatch(/^trap '\{ __pt_ps="\$\{pipestatus\[\*\]\}"; \} 2>\/dev\/null; printf /);
+		expect(exitTrap("/opt/homebrew/bin/bash", { report: true })).toMatch(/^trap '\{ __pt_ps="\$\{PIPESTATUS\[\*\]\}"; \} 2>\/dev\/null; printf /);
 		// Any other shell has neither: the run's folder is reported alone.
 		expect(exitTrap("/bin/sh", { report: true })).toBe(`trap 'printf "%s\\n%s\\n" "" "\${BUSYBOX_RUN_DIR:-}" >"$PITIME_FACTS_FILE" 2>/dev/null' EXIT; `);
 		// With the carry, the directory is written after the statuses are safe.
-		expect(exitTrap("/bin/zsh", { report: true, carryCwd: true })).toMatch(/^trap '__pt_ps="[^"]+"; pwd -P >"\$PITIME_CWD_FILE" 2>\/dev\/null; printf /);
+		expect(exitTrap("/bin/zsh", { report: true, carryCwd: true })).toMatch(/^trap '\{ __pt_ps="[^"]+"; \} 2>\/dev\/null; pwd -P >"\$PITIME_CWD_FILE" 2>\/dev\/null; printf /);
 		expect(exitTrap("/bin/zsh", {})).toBe("");
 	});
 

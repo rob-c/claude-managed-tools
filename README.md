@@ -34,17 +34,20 @@ command, each there because its absence made a model misread a run:
 The model reads:
 
 ```
-run=R134 exit_code=0 timed_out=false cancelled=false duration_ms=8421
-timeline_lines=3 shown=3 truncated=false
---- timeline ---
-[0.011354208 out] ok 1
-[2.320004125 err] FAILED test_x
-[8.421130000 out] done
-timing: 8.42s total, 3 lines, output from 0.01s, stderr from 2.32s, longest pause 6.10s (2.32s → 8.42s)
+run=R134 exit_code=0 duration_ms=8421
+[0.011 out] collecting
+collected 3 items
+ok 1
+[2.320 err] FAILED test_x
+[8.421 out] done
+--- pi-time ---
+timing: 8.42s total, 5 lines, output from 0.01s, stderr from 2.32s, longest pause 6.10s (2.32s → 8.42s)
 ```
 
-The offset is seconds since the command started, to the nanosecond (busybox-static 0.6.1;
-older builds pad the number or print six decimals, and every shape is read).
+A stamp starts a burst: seconds since the command started, and the stream. The lines
+under it with no stamp arrived at that same millisecond on that same stream, so every
+change of stream is marked and nothing is repeated. After `--- pi-time ---` come the
+capture's own notes. The capture itself keeps nanoseconds; `busybox log` prints them.
 
 You see the command's own lines:
 
@@ -119,7 +122,7 @@ Five function hooks in [`hooks/register.tsx`](hooks/register.tsx):
 |---|---|
 | `tool.call` on Bash | The guard: a command ending in `2>&1`, `\|&` or `&>`, or one that cannot end on its own here (a pager, an editor, `tail -f`, a foreground server), is refused before the permission check, with the rewrite. |
 | `tool.run` on Bash | The wrapper: the call is re-issued as `busybox run --timestamps … -- <shell> -c '<command>'`. A `TIMEOUT`, `IDLE`, `CANCELLED` or `KILLED` notice goes in front of the result; the digest, the pointer into a truncated view and the notes on what the command hid go after it. |
-| `ui.render` on the tool row | Your view: the same result drawn without the prefixes and the header. The stored result keeps them. |
+| `ui.render` on the tool row | Your view: the same result drawn without the stamps and the header (the stored result keeps them), and while a command runs, its newest lines and a sign of life. |
 | `prompt.compose` | Tells the model what the timeline is, only while it is on. |
 | `command.run` | `/pi-time`, and `/sh <command>` for commands you run yourself. |
 
@@ -144,8 +147,14 @@ still refused; with a `Bash(touch:*)` deny rule, `touch` was denied.
 
 Worth knowing before you turn it on:
 
-- **Output arrives when the command ends.** `busybox run` prints its view at exit, so
-  there is no live output while a command runs.
+- **A running command shows its newest lines and a sign of life.** `busybox run` prints
+  its view when the command ends, so the plugin reads the capture as it grows and draws
+  the last few lines under the command's row, with one line that says it is alive:
+  `running 47s · last output 31s ago · CPU busy (98% of a processor): working`, or
+  `CPU idle: waiting on something`. The processor is read from `ps` for the command's own
+  process group, every three seconds. Nothing is read for the first second and a half, so
+  a quick command pays nothing. The model is sent none of this; it reads the result. The
+  `live` option turns it off.
 - **Every command with no timeout of its own is stopped at the deadline** (120 s by
   default) and comes back as a `TIMEOUT`: a Bash call that names no `timeout`, and the
   commands you run yourself with `!` or `/sh`. A call's own `timeout` still wins. Claude
@@ -153,15 +162,23 @@ Worth knowing before you turn it on:
   that tool, so a slow foreground command is ended, not backgrounded. For Claude's calls,
   raise `timeout` or use `run_in_background`; for your own, `/pi-time timeout <seconds>`
   (or `off`) changes the deadline for the session.
-- **A command that prints nothing for 120 s is stopped**, whatever its deadline, and
-  comes back as `IDLE`. Under the default deadline this changes nothing (the deadline
-  fires first when the two are equal). It matters when a call raises its `timeout`: a
-  command given ten minutes that hangs at once comes back after two. The cost is real: a
-  command that is working and silent — a quiet compile, `sleep 300`, a test with no
-  output — is stopped too. Output on either stream resets the clock, so the fix is a
-  verbose flag or `run_in_background`; `/pi-time idle <seconds|off>` changes the limit for
-  the session. In the sandbox, where there is no pseudo-terminal, a program that
-  block-buffers its stdout can look silent while it works.
+- **A command with no sign of life for 120 s is stopped**, whatever its deadline, and
+  comes back as `IDLE`. A sign of life is a line on either stream *or* processor time: a
+  compiler that prints nothing for five minutes is working and is left alone, and a
+  command blocked on a lock or a prompt is waiting and is stopped. The line between them
+  is a hundredth of a processor over the silence. Under the default deadline this changes
+  nothing (the deadline fires first when the two are equal); it matters when a call raises
+  its `timeout`: a command given ten minutes that hangs at once comes back after two. A
+  command that is *meant* to wait — `sleep 300`, a server — is still stopped, and belongs
+  in `run_in_background`. `/pi-time idle <seconds|off>` changes the limit for the session.
+  When a deadline fires on a watched command, its `TIMEOUT` says what the processor was
+  doing: "it used 117.3s of processor time in 120s … it was working, not stuck" or "…none
+  at the end … waiting on something", so the model knows whether more time would help.
+- **Where a command cannot be watched, silence alone decides, as before.** The watch
+  needs the command's shell to write one small file in the plugin's data folder. In
+  Claude Code's sandbox it cannot; after the first such call the plugin stops trying, and
+  those calls get the capture's own limit (`--idle-timeout`), which knows only output.
+  Your own `!` and `/sh` commands use that limit too.
 - **A command that cannot end is refused before it runs.** Nobody can press `q` or Ctrl-C
   for a command here, so a pager (`git log | less`), an editor, `tail -f`, `watch`, `top`,
   `git rebase -i` or a foreground server (`npm run dev`, `python3 -m http.server`) would
@@ -204,11 +221,15 @@ Worth knowing before you turn it on:
   them are on stderr (a view with no `[err]` line otherwise reads as "no errors"), and the
   command that reads them. Without the wrapper Claude Code moves such a result to a file
   and shows the model its first 2 KB.
-- **An offset is printed once per burst.** A line that arrived at the same offset as the
-  line above it reads `[= out]` instead of repeating the digits (measured in
-  pi-managed-tools: the stamps were a quarter of all Bash-result bytes). The stream tag
-  stays on every line and nothing is lost; the `compactStamps` option prints the digits on
-  every line again.
+- **A stamp starts a burst, and offsets are to the millisecond.** A line that arrived at
+  the same offset and on the same stream as the line above it carries no stamp. A line at
+  the same offset that needs a mark — another stream, or text of its own that begins with
+  `[` or looks like the capture's — reads `[= err] text`. See [What it costs in
+  tokens](#what-it-costs-in-tokens) for why. `compactStamps` off puts a stamp on every
+  line again, and `stampDigits` sets the decimals (9 is what the capture keeps).
+- **The header is one line.** `run=R12 exit_code=0 duration_ms=328`, with `timed_out=true`,
+  `idle=true` or `cancelled=true` only when one of them is, and a second line with the
+  line counts only when the view was cut.
 - **A pipeline's result says how each stage ended, when that differs from the exit code
   shown.** The child shell leaves the statuses of its last pipeline behind
   (`pipeline stage statuses: 1 141 0`), so a `cmd | head` whose stages all exited 0 earns
@@ -297,11 +318,11 @@ recognised case it runs your shell inside `busybox run`:
 
 ```
 ❯ ! pytest -q
-  ⎿  run=R134 exit_code=1 timed_out=false cancelled=false duration_ms=8421
-     --- timeline ---
-     [0.011354208 out] ok 1
-     [2.320004125 err] FAILED test_x
-     [8.421130000 out] done
+  ⎿  run=R134 exit_code=1 duration_ms=8421
+     [0.011 out] ok 1
+     [2.320 err] FAILED test_x
+     [8.421 out] done
+     --- pi-time ---
      timing: 8.42s total, 3 lines, output from 0.01s, stderr from 2.32s, longest pause 6.10s (2.32s → 8.42s)
 ```
 
@@ -369,11 +390,13 @@ session by an environment variable:
 | `verbosity` | `CLAUDE_MANAGED_TOOLS_VERBOSITY` | `normal` | `quiet` 6 KB, `normal` 24 KB, `verbose` 27 KB (the most Claude Code shows inline), `brief` (repeats collapsed, no per-line timing). |
 | `pty` | `CLAUDE_MANAGED_TOOLS_PTY` | `split` | `split` (stdout a pty, stderr a pipe), `off`, `merged`, `raw`. |
 | `timeoutSeconds` | `CLAUDE_MANAGED_TOOLS_TIMEOUT` | 120 | Default deadline for every command that names none: a Bash call with no `timeout`, and your own `!` and `/sh` commands. 0 leaves Claude Code's own default in charge of Bash calls and puts no deadline on yours. |
-| `idleSeconds` | `CLAUDE_MANAGED_TOOLS_IDLE` | 120 | Stop a command that prints nothing on either stream for this long, whatever its deadline, as a named `IDLE`. 0 or `off` removes the limit. Needs busybox 0.6.0. |
+| `idleSeconds` | `CLAUDE_MANAGED_TOOLS_IDLE` | 120 | Stop a command that shows no sign of life for this long — no output and no processor time — whatever its deadline, as a named `IDLE`. 0 or `off` removes the limit. |
 | `unbuffer` | `CLAUDE_MANAGED_TOOLS_UNBUFFER` | on | Switch programs' output buffering off through the environment (see [Buffering](#buffering)). |
 | `preloadStdbuf` | `CLAUDE_MANAGED_TOOLS_PRELOAD` | off | Linux: preload `stdbuf`'s library so C-stdio programs line-buffer too. |
 | `autoUpdate` | `CLAUDE_MANAGED_TOOLS_UPDATE` | on | Keep the plugin's own busybox at the latest release (one GitHub request a day). |
-| `compactStamps` | `CLAUDE_MANAGED_TOOLS_COMPACT_STAMPS` | on | Print an offset once per burst: `[= out]` for a line at the offset of the one above. |
+| `compactStamps` | `CLAUDE_MANAGED_TOOLS_COMPACT_STAMPS` | on | One stamp per burst: a line at the offset and on the stream of the one above carries none. Off puts a stamp on every line. |
+| `stampDigits` | `CLAUDE_MANAGED_TOOLS_STAMP_DIGITS` | 3 | Decimals of an offset the model is shown, 1 to 9. The capture keeps nanoseconds either way. |
+| `live` | `CLAUDE_MANAGED_TOOLS_LIVE` | on | Show a running command's newest lines and a sign of life under its row, and judge "stuck" by the processor as well as by silence. |
 | `guard` | `CLAUDE_MANAGED_TOOLS_GUARD` | on | Refuse a stream merge at a command's tail, and a command that cannot end on its own here. |
 | `carryCwd` | — | on | Keep a successful `cd` between calls. |
 | `wrapBang` | — | on | Run your own `!` commands inside the capture, through the shell shim. |
@@ -394,7 +417,7 @@ No build step and no dependencies: the hooks module is TypeScript the engine loa
 
 ```sh
 claude plugin validate .   # what the module hooks, calls and reads
-claude plugin test .       # 286 tests, pure logic and the hooks against the engine
+claude plugin test .       # 327 tests, pure logic and the hooks against the engine
 tsc -p .                   # after one interactive load has laid .claude-plugin/types
 ```
 
@@ -404,8 +427,42 @@ both repositories. `tests/hardening.test.ts` holds the rules that came across fr
 0.23.0 hardening pass, one group per thing that had been assumed and is now measured. `src/policy.ts` (deadlines, shell), `src/busybox.ts` (finding and
 installing the binary) and `src/prompt.ts` are specific to Claude Code.
 
-The function-hook API this plugin stands on is early access and may change between
-Claude Code releases. It was written and tested against 2.1.331.
+Written and tested against Claude Code 2.1.331.
+
+## What it costs in tokens
+
+The timeline is not free: everything the plugin adds to a result is read by the model, and
+stays in the conversation for every later turn. So it is measured, with the API's own
+count, on results from real sessions.
+
+Sixty wrapped results (1,816 lines of output, 45,700 tokens of the commands' own text):
+
+| What the model was sent | Tokens the plugin added | Per result | On top of the output |
+|---|---|---|---|
+| 0.4.1: a nanosecond stamp on every line, a three-line header | 24,500 | 408 | 54% |
+| 0.5.0: `[= out]` for a repeated offset | 19,000 | 317 | 42% |
+| 0.6.0: one stamp per burst, to the millisecond, a one-line header | 6,200 | 103 | 14% |
+
+Where it went:
+
+- **Stamps.** `[0.030555209 out] ` is eighteen characters and about ten tokens: digits are
+  expensive to a tokenizer. Output arrives in bursts — over 13,616 lines from 416 results,
+  54% share their offset with the line above to the nanosecond and 86% to the millisecond —
+  so a stamp per burst says the same thing in a fraction of the tokens.
+- **The header.** Three lines were 76 tokens a call; one line is 20. Four results in ten
+  are under 600 characters, and for those the header was half the text.
+- **The system prompt section and the skill's description**, which are read on every
+  request: 1,867 tokens before, 1,239 now. The long form of each paragraph is in the
+  skill, which is loaded only when it is needed.
+
+Before the format changed, a model (Claude Haiku) was asked eight questions with known
+answers about one result in the new spelling — which stream a line arrived on, at what
+offset, how long between two lines, whether a line was output or a note. It answered all
+eight in every run: five in this spelling, and four each in three other candidates. That is
+one small result and one model, so it shows the spelling can be read, not that it always is.
+
+To spend less still: `verbosity` `quiet` caps a view at 6 KB instead of 24. To spend
+more for more precision: `stampDigits` 9, and `compactStamps` off.
 
 ## How a command becomes a timeline, and why
 
@@ -455,9 +512,9 @@ flowchart TD
         V["At exit, one bounded view<br/>a header, then the interleaved timeline<br/>(head and tail when over 24 KB)"]
     end
     subgraph BACK["Back in the tool.run hook"]
-        S["The result is dressed<br/>TIMEOUT or IDLE notice first<br/>a repeated offset becomes [= out]<br/>timing digest, pointer into a cut view,<br/>pipeline stage statuses"]
+        S["The result is dressed<br/>TIMEOUT or IDLE notice first<br/>one stamp per burst, to the millisecond<br/>timing digest, pointer into a cut view,<br/>pipeline stage statuses"]
     end
-    MODEL["The model reads the timeline<br/>[0.011354208 out] ok 1<br/>[2.320004125 err] FAILED test_x<br/>[8.421130000 out] done"]
+    MODEL["The model reads the timeline<br/>[0.011 out] ok 1<br/>[2.320 err] FAILED test_x<br/>[8.421 out] done"]
     YOU["ui.render hook: you see<br/>the command's own lines<br/>ok 1, FAILED test_x, done"]
 
     M --> G

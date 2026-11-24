@@ -227,23 +227,21 @@ describe("how a run ended, from its header alone", () => {
 describe("what the model is told about this build", () => {
 	const base = { busybox: "/b/busybox", verbosity: "normal", pty: "split", timeoutSeconds: 120, guard: true, carryCwd: true } as const;
 
-	test("the example offsets are the shape this build printed, whichever that is", () => {
-		// Each shape a release has had, read off a line and drawn back the same way.
-		const shapes: Array<[line: string, example: RegExp]> = [
-			["[   0.006244 out] pi-time-probe", /`\[ {3}0\.012345 out\] text`/],
-			["[00000.005868042 out] pi-time-probe", /`\[00000\.012345678 out\] text`/],
-			["[0.005868042 out] pi-time-probe", /`\[0\.012345678 out\] text`/],
-		];
-		for (const [line, example] of shapes) {
-			expect(sectionText({ ...base, stamp: stampShape(line) })).toMatch(example);
+	test("the example offsets are what a result shows, whatever shape the build printed", () => {
+		// Every shape a release has had is respelled the same way before the model reads
+		// it — unpadded, to the digits asked for — so the example is the same for each.
+		for (const line of ["[   0.006244 out] pi-time-probe", "[00000.005868042 out] pi-time-probe", "[0.005868042 out] pi-time-probe"]) {
+			expect(sectionText({ ...base, stamp: stampShape(line) })).toMatch(/`\[0\.012 out\] text`/);
+			expect(sectionText({ ...base, stamp: stampShape(line), stampDigits: 6 })).toMatch(/`\[0\.012345 out\] text`/);
 		}
-		// One shape at a time: the prompt no longer hedges with "one build zero-pads".
-		expect(sectionText({ ...base, stamp: stampShape("[0.005868042 out] x") })).not.toMatch(/zero-pads|0\.012345 out\]/);
+		// A build that prints six digits cannot be shown with nine.
+		expect(sectionText({ ...base, stamp: stampShape("[   0.006244 out] x"), stampDigits: 9 })).toMatch(/`\[0\.012345 out\] text`/);
+		expect(sectionText({ ...base, stamp: stampShape("[0.005868042 out] x"), stampDigits: 9 })).toMatch(/`\[0\.012345678 out\] text`/);
+		expect(sectionText(base)).not.toMatch(/zero-pads/);
 	});
 
 	test("the person's own commands are said to share the deadline, and how they lift it", () => {
-		expect(sectionText({ ...base, bang: true })).toMatch(/with `!`, or runs with `\/sh`, also goes through the capture, under the same 120s deadline:/);
-		expect(sectionText({ ...base, bang: true })).toMatch(/`\/pi-time timeout <seconds>` is how they give it longer/);
+		expect(sectionText({ ...base, bang: true })).toMatch(/runs with `!` or `\/sh` arrives in `<bash-stdout>` as the same timeline, under the same 120s deadline \(`\/pi-time timeout <seconds>` is theirs to raise\)/);
 		expect(sectionText({ ...base, bang: false })).toMatch(/arrives as a timeline, under the same 120s deadline/);
 		// With no default of ours there is no such deadline to describe.
 		expect(sectionText({ ...base, bang: true, timeoutSeconds: 0 })).not.toMatch(/same \d+s deadline|pi-time timeout/);
@@ -251,12 +249,15 @@ describe("what the model is told about this build", () => {
 
 	test("IDLE is explained only while a silence limit is in force", () => {
 		expect(sectionText(base)).not.toMatch(/IDLE/);
-		expect(sectionText({ ...base, idleSeconds: 30 })).toMatch(/prints nothing on either stream for 30s is taken to be stuck and stopped, whatever `timeout` the call names/);
-		expect(sectionText({ ...base, idleSeconds: 30 })).toMatch(/`IDLE` is that, not a failure and not the deadline/);
+		expect(sectionText({ ...base, idleSeconds: 30 })).toMatch(/and a command that prints nothing for 30s is stopped whatever its `timeout`/);
+		expect(sectionText({ ...base, idleSeconds: 30 })).toMatch(/opens with `TIMEOUT` or `IDLE` is that, not a failure of the command/);
+		expect(sectionText({ ...base, idleSeconds: 30 })).toMatch(/after `IDLE`, find what it was blocked on or make a quiet command report progress/);
+		// With no deadline of ours the silence limit is still said, as its own sentence.
+		expect(sectionText({ ...base, timeoutSeconds: 0, idleSeconds: 30 })).toMatch(/\n\nA command that prints nothing for 30s is stopped whatever its `timeout`\. /);
 	});
 
 	test("the newer log queries are named only for a build that has them", () => {
 		expect(sectionText(base)).not.toMatch(/--around-gap/);
-		expect(sectionText({ ...base, logQuery: true })).toMatch(/`--since S --until S` a window of the timeline, and `--around-gap 1` its longest silences/);
+		expect(sectionText({ ...base, logQuery: true })).toMatch(/\(or `--match STR`, `--stream stderr`, `--sample N`, `--since S --until S`, `--around-gap 1`\)/);
 	});
 });

@@ -192,7 +192,7 @@ describe("settings", () => {
 		const options = { enabled: false, verbosity: "quiet", pty: "off", timeoutSeconds: 30, extraEnv: "A=1" };
 		const fromOptions = readWrapSettings({}, options);
 		// No idle option given: the built-in silence limit, the same number pi uses.
-		expect(fromOptions).toEqual({ enabled: false, verbosity: "quiet", pty: "off", timeoutSeconds: 30, idleSeconds: 120, unbuffer: true, preload: false, compactStamps: true, extraEnv: [["A", "1"]] });
+		expect(fromOptions).toEqual({ enabled: false, verbosity: "quiet", pty: "off", timeoutSeconds: 30, idleSeconds: 120, unbuffer: true, preload: false, compactStamps: true, stampDigits: 3, live: true, extraEnv: [["A", "1"]] });
 		expect(readWrapSettings({}, { ...options, idleSeconds: 0 }).idleSeconds).toBe(0);
 		expect(readWrapSettings({ CLAUDE_MANAGED_TOOLS_IDLE: "off" }, options).idleSeconds).toBe(0);
 		const fromEnv = readWrapSettings(
@@ -205,7 +205,15 @@ describe("settings", () => {
 			},
 			options,
 		);
-		expect(fromEnv).toEqual({ enabled: true, verbosity: "verbose", pty: "merged", timeoutSeconds: 0, idleSeconds: 120, unbuffer: true, preload: false, compactStamps: true, extraEnv: [["B", "2"]] });
+		expect(fromEnv).toEqual({ enabled: true, verbosity: "verbose", pty: "merged", timeoutSeconds: 0, idleSeconds: 120, unbuffer: true, preload: false, compactStamps: true, stampDigits: 3, live: true, extraEnv: [["B", "2"]] });
+		// A running command is shown and watched unless told otherwise.
+		expect(readWrapSettings({}, { live: false }).live).toBe(false);
+		expect(readWrapSettings({ CLAUDE_MANAGED_TOOLS_LIVE: "off" }).live).toBe(false);
+		// Milliseconds unless told otherwise; anything that is not 1 to 9 leaves the default.
+		expect(readWrapSettings({}, { stampDigits: 9 }).stampDigits).toBe(9);
+		expect(readWrapSettings({ CLAUDE_MANAGED_TOOLS_STAMP_DIGITS: "6" }, { stampDigits: 9 }).stampDigits).toBe(6);
+		for (const bad of ["0", "12", "2.5", "many", ""]) expect(readWrapSettings({ CLAUDE_MANAGED_TOOLS_STAMP_DIGITS: bad }).stampDigits).toBe(3);
+		expect(readWrapSettings({}, { stampDigits: 0 }).stampDigits).toBe(3);
 		// One offset per burst unless told otherwise.
 		expect(readWrapSettings({}, { compactStamps: false }).compactStamps).toBe(false);
 		expect(readWrapSettings({ CLAUDE_MANAGED_TOOLS_COMPACT_STAMPS: "off" }).compactStamps).toBe(false);

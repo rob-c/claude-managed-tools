@@ -59,7 +59,11 @@ describe("the digest", () => {
 		const text = timeline([[1_000, "out", "a"], [2_000, "out", "b"]]);
 		expect(summarizeTiming(parseTimeline(text), 42)).toBe(undefined);
 		expect(summarizeTiming([], 10_000)).toBe(undefined);
-		expect(summarizeTiming(parseTimeline(timeline([[1_000, "out", "only"]])), 5_000)).toBe(undefined);
+		expect(summarizeTiming(parseTimeline(timeline([[1_000, "out", "only"]])), 800)).toBe(undefined);
+		// One line and then five silent seconds is a shape, and is said.
+		expect(summarizeTiming(parseTimeline(timeline([[1_000, "out", "started"]])), 5_000)).toBe(
+			"timing: 5.00s total, 1 line, output from 0.00s, silent 5.00s after the last line (0.00s → 5.00s)",
+		);
 	});
 
 	test("several pauses are counted, not just the longest", () => {
@@ -86,7 +90,8 @@ describe("the truncation pointer", () => {
 		// The view keeps the head, so the useful instruction is how to read the end.
 		expect(hint).toMatch(/69 of 5000 lines shown, head only/);
 		expect(hint).toMatch(/busybox log R663 --stream timeline --lines 4960:5000/);
-		expect(hint).toMatch(/busybox log R663 --match STR/);
+		// The same command with another flag finds a literal: the binary is named once.
+		expect(hint).toMatch(/reads the end, and --match STR in place of --stream and --lines finds a literal$/);
 		// The packaged build is not on PATH here, so the pointer names the binary it was given.
 		const absolute = truncationHint(text, "/data/bin/busybox") ?? "";
 		expect(absolute).toMatch(/\/data\/bin\/busybox log R663 --stream timeline --lines 4960:5000/);

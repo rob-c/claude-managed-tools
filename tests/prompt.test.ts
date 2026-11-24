@@ -20,24 +20,43 @@ describe("the Pi-Time section", () => {
 
 	test("names the three facts: stream, offset, deadline", () => {
 		const text = sectionText(BASE);
-		// With no line of the build's to go by, the examples are the current release's shape.
-		expect(text).toMatch(/`\[0\.012345678 out\] text`/);
-		expect(text).toMatch(/`\[0\.012349012 err\] text`/);
-		expect(text).toMatch(/seconds since the command started, to the nanosecond/);
-		// A build that was run at session start gets its own shape and its own header: an
-		// example cut from a real line cannot go stale when a release changes the padding.
-		const older = sectionText({
-			...BASE,
-			stamp: { pad: "space", width: 4, digits: 6 },
-			header: "run=R7 exit_code=0 timed_out=false cancelled=false idle=false duration_ms=4",
-		});
-		expect(older).toMatch(/`\[ {3}0\.012345 out\] text` or `\[ {3}0\.012349 err\] text`/);
-		expect(older).toMatch(/opens with `run=R12 exit_code=0 timed_out=false cancelled=false idle=false duration_ms=328`/);
-		expect(older).toMatch(/to the microsecond/);
-		expect(older).not.toMatch(/0\.012345678/);
-		expect(text).toMatch(/`timing:` line/);
+		// The header as the model is shown it: one line, with only what says something.
+		expect(text).toMatch(/A result opens with `run=R12 exit_code=0 duration_ms=328`, then `\[0\.012 out\] text` starts a burst/);
+		expect(text).toMatch(/seconds since the command started, and the stream \(`out` or `err`\) it arrived on/);
 		expect(text).toMatch(/stopped after 120s/);
-		expect(text).toMatch(/`TIMEOUT` is a deadline, not a failure of the command/);
+		expect(text).toMatch(/A result that opens with `TIMEOUT` is that, not a failure of the command, and keeps what it printed/);
+	});
+
+	test("the example is what a result looks like: this build's header, the digits the model is shown", () => {
+		// A header this build printed, slimmed the way every result's is.
+		const measured = sectionText({ ...BASE, header: "run=R7 exit_code=0 timed_out=false cancelled=false idle=false duration_ms=4" });
+		expect(measured).toMatch(/opens with `run=R12 exit_code=0 duration_ms=328`/);
+		expect(measured).not.toMatch(/timed_out=false|idle=false|--- timeline ---/);
+		// The precision asked for…
+		expect(sectionText({ ...BASE, stampDigits: 6 })).toMatch(/`\[0\.012345 out\] text`/);
+		expect(sectionText({ ...BASE, stampDigits: 9 })).toMatch(/`\[0\.012345678 out\] text`/);
+		// …or fewer, when the build prints fewer: no example promises digits a result will not have.
+		expect(sectionText({ ...BASE, stampDigits: 9, stamp: { pad: "space", width: 4, digits: 6 } })).toMatch(/`\[0\.012345 out\] text`/);
+		// Never padded: every result's offsets are written without padding.
+		expect(sectionText({ ...BASE, stamp: { pad: "zero", width: 5, digits: 9 } })).toMatch(/`\[0\.012 out\] text`/);
+	});
+
+	test("one stamp per burst is explained while it is done, and a stamp per line when it is not", () => {
+		const burst = sectionText(BASE);
+		expect(burst).toMatch(/Lines under it with no stamp arrived at that same offset on that same stream; `\[= err\] text` is one at the same offset that needed a mark of its own/);
+		const perLine = sectionText({ ...BASE, compactStamps: false });
+		expect(perLine).toMatch(/then one line per record in arrival order, `\[0\.012 out\] text` or `\[0\.012 err\] text`/);
+		expect(perLine).not.toMatch(/burst|\[= err\]/);
+		// Either way the notes are told from the output by the line in front of them.
+		for (const text of [burst, perLine, sectionText({ ...BASE, verbosity: "brief" })]) {
+			expect(text).toMatch(/Lines after `--- pi-time ---` are the capture's own notes, not output\./);
+		}
+	});
+
+	test("it is short: read on every request, it is a standing cost", () => {
+		// 4,511 characters and 1,596 tokens before it was cut to what a model acts on.
+		const full = sectionText({ ...BASE, busybox: "/Users/x/.claude/plugins/data/managed-tools-rob-c/bin/busybox", bang: true, idleSeconds: 120, logQuery: true, platform: "darwin" });
+		expect(full.length < 3000).toBe(true);
 	});
 
 	test("forbids the merge, explains why, and names the override only while the guard is on", () => {
@@ -56,10 +75,10 @@ describe("the Pi-Time section", () => {
 	});
 
 	test("says what the terminal is, mode by mode", () => {
-		expect(sectionText(BASE)).toMatch(/stdout is a pseudo-terminal 200 columns by 50 rows, its stderr a pipe and its stdin empty/);
+		expect(sectionText(BASE)).toMatch(/stdout is a pseudo-terminal \(200 columns by 50 rows\) and stderr a pipe, so lines that share an offset were flushed together/);
 		// The two commands whose output a terminal changes most are named, with the way out.
-		expect(sectionText(BASE)).toMatch(/`ls -1` for one per line/);
-		expect(sectionText(BASE)).toMatch(/`ps -ww` for whole lines/);
+		expect(sectionText(BASE)).toMatch(/`ls` prints columns \(`ls -1` for one a line\)/);
+		expect(sectionText(BASE)).toMatch(/`ps` cuts lines at the width \(`ps -ww`\)/);
 		expect(sectionText({ ...BASE, pty: "off" })).toMatch(/plain pipes/);
 		expect(sectionText({ ...BASE, pty: "merged" })).toMatch(/every line is tagged `out`/);
 	});
@@ -71,7 +90,7 @@ describe("the Pi-Time section", () => {
 		// never returns in `raw`, which has no line discipline to end it.
 		for (const pty of ["split", "off", "merged"] as const) {
 			const text = sectionText({ ...BASE, pty });
-			expect(text).toMatch(/A command's stdin is empty: a read returns end-of-file at once, so a prompt \(`\[y\/N\]`, a password\) takes its default or fails/);
+			expect(text).toMatch(/A command's stdin is empty \(a read returns end-of-file at once\), so a prompt takes its default or fails: give the answer in the command/);
 			expect(text).not.toMatch(/never returns/);
 		}
 		const raw = sectionText({ ...BASE, pty: "raw" });
@@ -83,7 +102,7 @@ describe("the Pi-Time section", () => {
 
 	test("names what cannot end here, and says it is refused only while the guard is on", () => {
 		expect(sectionText(BASE)).toMatch(/a pager, an editor, `tail -f`, `watch` or a foreground server never ends here and is refused before it runs/);
-		expect(sectionText(BASE)).toMatch(/Start what must keep running with `run_in_background: true`/);
+		expect(sectionText(BASE)).toMatch(/start what must keep running with `run_in_background: true`/);
 		const unguarded = sectionText({ ...BASE, guard: false });
 		expect(unguarded).toMatch(/never ends here, and runs until the deadline/);
 		expect(unguarded).not.toMatch(/is refused before it runs/);
@@ -91,26 +110,19 @@ describe("the Pi-Time section", () => {
 
 	test("a truncated view is described as it is: head and tail, with the cut between", () => {
 		const text = sectionText(BASE);
-		expect(text).toMatch(/`truncated=true` shows the head and the tail of the output with the cut marked between them/);
+		expect(text).toMatch(/`truncated=true` shows the head and the tail with the cut marked between them/);
 		expect(text).not.toMatch(/head only/);
 		// The stderr count is only promised for a build whose `log` can give it.
-		expect(text).not.toMatch(/how many of them are on stderr/);
-		expect(sectionText({ ...BASE, logQuery: true })).toMatch(/names the omitted lines, how many of them are on stderr, and the command that reads them/);
+		expect(text).not.toMatch(/how many are on stderr/);
+		expect(sectionText({ ...BASE, logQuery: true })).toMatch(/names the omitted lines, how many are on stderr, and the command that reads them/);
 		// No count of kept runs that another session could falsify.
-		expect(text).toMatch(/Captures are kept for at least two hours, and the newest 200 for longer/);
-	});
-
-	test("an offset said once per burst is explained only while it is done", () => {
-		expect(sectionText(BASE)).not.toMatch(/\[= out\]/);
-		expect(sectionText({ ...BASE, compactStamps: true })).toMatch(/carries `\[= out\]` or `\[= err\]` instead of the digits again/);
-		// `brief` has no offsets at all.
-		expect(sectionText({ ...BASE, compactStamps: true, verbosity: "brief" })).not.toMatch(/\[= out\]/);
+		expect(text).not.toMatch(/last 20|runs are kept/);
 	});
 
 	test("brief promises no offsets, because that mode has none", () => {
 		const brief = sectionText({ ...BASE, verbosity: "brief" });
 		expect(brief).toMatch(/no per-line offsets/);
-		expect(brief).not.toMatch(/0\.012345/);
+		expect(brief).not.toMatch(/0\.012|burst|\[= err\]/);
 	});
 
 	test("the deadline and cd sentences follow the settings", () => {

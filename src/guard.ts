@@ -14,10 +14,27 @@
 
 /** Patterns that merge the two streams inside the child, defeating the tags. */
 const MERGE_PATTERNS: { pattern: RegExp; label: string }[] = [
-	{ pattern: /2>\s*&1/, label: "2>&1" },
-	{ pattern: /\|&/, label: "|&" },
-	{ pattern: /(?:^|\s)&>>?/, label: "&>" },
+	{ pattern: /2>\s*&1/g, label: "2>&1" },
+	{ pattern: /\|&/g, label: "|&" },
+	// `&>file` is `>file 2>&1`. Into /dev/null it merges nothing: see `mergesIntoNull`.
+	{ pattern: /(?:^|\s)&>>?(?!>)(?!\s*\/dev\/null(?:\s|$))/g, label: "&>" },
 ];
+
+/**
+ * True when the `2>&1` at `at` joins stderr to a stdout that already goes to /dev/null.
+ *
+ * `make >/dev/null 2>&1` merges nothing: both streams are thrown away, and there is no
+ * `[err]` tag to lose because there is no line. Refusing it refused the commonest idiom in
+ * shell (a pi session lost a turn to `… >/dev/null 2>&1; python3 -c …`). A merge into a
+ * *file* (`>srv.log 2>&1`) is still refused: that file is read back as evidence, with the
+ * streams no longer told apart. The order matters and is respected: in `2>&1 >/dev/null`
+ * stderr goes to the original stdout, which is the view.
+ */
+function mergesIntoNull(line: string, at: number): boolean {
+	const before = line.slice(0, at);
+	const start = Math.max(before.lastIndexOf(";"), before.lastIndexOf("|"), before.lastIndexOf("&&") + 1, before.lastIndexOf("("), before.lastIndexOf("{")) + 1;
+	return /(?:^|\s)1?>>?\s*\/dev\/null\s*$/.test(before.slice(start));
+}
 
 /** Declaring a merge intentional: the marker survives as a comment on any shell. */
 export const OVERRIDE_MARKER = "# pitime-safe";
@@ -31,8 +48,13 @@ const TAIL_CHARS = 24;
  * reflex shape the benchmark caught, hence two lines and not one.
  */
 export function tailZone(command: string): string[] {
-	const lines = command.replace(/\s+$/, "").split("\n");
-	return lines.slice(-TAIL_LINES).map((line) => line.slice(-TAIL_CHARS));
+	return tailLines(command).map((line) => line.slice(-TAIL_CHARS));
+}
+
+/** The last lines of a command as the shell reads them: no quoted text, no heredoc bodies, no comments. */
+function tailLines(command: string): string[] {
+	const lines = maskQuotes(stripHeredocs(command)).split("\n").map((line) => line.replace(/(?:^|\s)#.*$/, "")).join("\n").replace(/\s+$/, "").split("\n");
+	return lines.slice(-TAIL_LINES);
 }
 
 export interface MergeHit {
@@ -42,10 +64,15 @@ export interface MergeHit {
 
 /** The merge sitting at the command's tail, if there is one. */
 export function detectTailMerge(command: string): MergeHit | undefined {
-	for (const zone of tailZone(command)) {
+	for (const line of tailLines(command)) {
+		const from = Math.max(0, line.length - TAIL_CHARS);
 		for (const { pattern, label } of MERGE_PATTERNS) {
-			const match = pattern.exec(zone);
-			if (match) return { label, excerpt: zone.trim() };
+			for (const match of line.matchAll(pattern)) {
+				// Only the tail is judged, but the whole line says where stdout was going.
+				if (match.index + match[0].length <= from) continue;
+				if (label === "2>&1" && mergesIntoNull(line, match.index)) continue;
+				return { label, excerpt: line.slice(from).trim() };
+			}
 		}
 	}
 	return undefined;
@@ -53,7 +80,7 @@ export function detectTailMerge(command: string): MergeHit | undefined {
 
 /** The model's explicit declaration that a merge is intentional. */
 export function hasOverride(command: string): boolean {
-	return /(?:^|\s)#\s*pitime-safe\b/.test(command);
+	return /(?:^|\s)#\s*pitime-safe\b/.test(maskQuotes(stripHeredocs(command)));
 }
 
 /**
@@ -183,13 +210,25 @@ export function resultNotes(command: string, options: NoteOptions = {}): string[
 			`\`${OVERRIDE_MARKER}\` declared: the [out]/[err] tags here are not evidence.`,
 		);
 	}
-	if (/(?:^|[\s;&(])1?>\s*\/dev\/null/.test(code)) {
+	// Where a redirect counts: in this call's own shell, and inside the string handed to a
+	// nested one (`sh -c 'cmd 2>/dev/null'` does discard the stream). Anywhere else a quoted
+	// `>/dev/null` is text: `echo ' >/dev/null is how you silence it'` discards nothing.
+	const redirects = /(?:^|[\s;&|(])(?:busybox\s+)?(?:sh|bash|zsh|ash|dash)\s+-[a-z]*c\b/.test(bare) ? code : bare;
+	// Both streams thrown away together: `>/dev/null 2>&1`, `&>/dev/null`.
+	const bothNull = /(?:^|[\s;&(])(?:1?>\s*\/dev\/null\s+2>\s*&1|&>>?\s*\/dev\/null)/.test(redirects);
+	if (bothNull) {
+		note("both-null", "stdout and stderr were both discarded by this command (`>/dev/null 2>&1`): nothing it printed is known to you.", "both streams were discarded: unknown.");
+	}
+	if (!bothNull && /(?:^|[\s;&(])1?>\s*\/dev\/null/.test(redirects)) {
 		note("stdout", "stdout was discarded by this command (`>/dev/null`): its content is unknown to you.", "stdout was discarded (`>/dev/null`): unknown.");
 	}
-	if (/(?:^|[\s;&(])2>\s*\/dev\/null/.test(code)) {
+	if (/(?:^|[\s;&(])2>\s*\/dev\/null/.test(redirects)) {
 		note("stderr", "stderr was discarded by this command (`2>/dev/null`): its content is unknown to you.", "stderr was discarded (`2>/dev/null`): unknown.");
 	}
-	if (/(?:^|[\s;])&\s*(?:#.*)?$/m.test(bare) && !/\bwaitfor\b|\bwait\b/.test(bare)) {
+	// A lone `&` anywhere (not `&&`, `&>`, `>&`, `|&`), unless the command itself waits for or
+	// ends what it started: `sleep 30 & … kill $!` leaves nothing running, and
+	// `sleep 2 & echo started` does although its `&` is not at the end of a line.
+	if (/(?<![&>|<])&(?![&>])/.test(bare) && !/\b(?:waitfor|wait|kill|pkill|killall)\b/.test(bare)) {
 		note(
 			"background",
 			"a process was left running in the background; the timeline stops at this call's exit — check on it before assuming it finished.",
@@ -207,13 +246,13 @@ export function resultNotes(command: string, options: NoteOptions = {}): string[
 	// read wrong more often than right. `head` closes the pipe early (the first command
 	// dies of SIGPIPE); `grep` makes exit 1 mean "no match"; and `|| true` replaces a
 	// failure with success by design.
-	const stage = lastPipelineStage(bare);
+	const { stage, isPiped } = lastPipelineStage(bare);
 	const stages = options.facts?.pipestatus;
 	if (stages !== undefined) {
 		// Known: say what each stage returned, and nothing when they all returned 0.
 		const fact = describePipestatus(stages, options.exitCode);
 		if (fact) notes.push(fact);
-	} else if (/^head\b/.test(stage)) {
+	} else if (isPiped && /^head\b/.test(stage)) {
 		// Two different facts, so two sentences: `head` can end the command early
 		// (SIGPIPE), `tail` never does — it reads to the end and only replaces the status.
 		note(
@@ -221,7 +260,7 @@ export function resultNotes(command: string, options: NoteOptions = {}): string[
 			"the pipeline ends in `head`: the exit_code shown is `head`'s, not the command's — and if `head` closed the pipe early the command was ended by SIGPIPE, so its own status is unknown.",
 			"exit_code is `head`'s, not the command's.",
 		);
-	} else if (/^tail\b/.test(stage)) {
+	} else if (isPiped && /^tail\b/.test(stage)) {
 		note(
 			"tail",
 			"the pipeline ends in `tail`: the exit_code shown is `tail`'s, not the command's — the command ran to its end, but its own status is not in this result.",
@@ -231,7 +270,8 @@ export function resultNotes(command: string, options: NoteOptions = {}): string[
 	// Only when it applies: with the header's code known, a `grep` that matched (0) needs
 	// no caveat at all.
 	if (/^grep\b/.test(stage) && (options.exitCode === undefined || options.exitCode === 1)) {
-		note("grep", "the pipeline ends in `grep`: exit_code 1 means no match, not a failed command.", "`grep` exit 1 = no match.");
+		// "The pipeline ends in" only where there is a pipeline: a bare `grep -c "a|b" f` has none.
+		note("grep", `${isPiped ? "the pipeline ends in `grep`" : "this is a `grep`"}: exit_code 1 means no match, not a failed command.`, "`grep` exit 1 = no match.");
 	}
 	if (/\|\|\s*(?:true|:)(?:\s|;|\)|$)/m.test(bare)) {
 		note(
@@ -260,11 +300,19 @@ export function resultNotes(command: string, options: NoteOptions = {}): string[
  * A trailing `&` and comment are stripped first. The caller hands in the command with
  * its quoted text blanked, so a `|` inside a pattern separates nothing.
  */
-function lastPipelineStage(command: string): string {
+/**
+ * The last stage of the last line, and whether that line pipes into it at all.
+ *
+ * Given the command with quoted text masked: `grep -c "a|tail" f` has no pipe, and in
+ * `make || tail -5 log` the `||` is not one either — both used to be told their exit
+ * status was `tail`'s.
+ */
+function lastPipelineStage(command: string): { stage: string; isPiped: boolean } {
 	const last = command.trimEnd().split("\n").pop() ?? "";
-	const stripped = last.replace(/\s*&\s*$/, "").replace(/\s*#.*$/, "");
-	const segments = stripped.split("|");
-	return (segments[segments.length - 1] ?? "").trim();
+	const stripped = last.replace(/\s*&\s*$/, "").replace(/(?:^|\s)#.*$/, "");
+	const statement = stripped.split(/&&|\|\||;/).pop() ?? "";
+	const segments = statement.split("|");
+	return { stage: (segments[segments.length - 1] ?? "").trim(), isPiped: segments.length > 1 };
 }
 
 // =============================================================================
@@ -294,7 +342,7 @@ function stripHeredocs(command: string): string {
 			continue;
 		}
 		out.push(line);
-		const start = /<<(-?)\s*(?:'([^']+)'|"([^"]+)"|\\?([A-Za-z_][A-Za-z0-9_]*))/.exec(line);
+		const start = /(?<![<\w)$])<<(?!<)(-?)\s*(?:'([^']+)'|"([^"]+)"|\\?([A-Za-z_][A-Za-z0-9_]*))/.exec(line);
 		if (start) {
 			stripTabs = start[1] === "-";
 			terminator = start[2] ?? start[3] ?? start[4];
@@ -317,7 +365,12 @@ export function maskQuotes(command: string): string {
 	for (let i = 0; i < command.length; i++) {
 		const char = command[i] as string;
 		if (quote === undefined) {
-			if (char === "\\" && i + 1 < command.length) {
+			if (char === "#" && (i === 0 || /\s/.test(command[i - 1] as string))) {
+				const end = command.indexOf("\n", i);
+				const stop = end < 0 ? command.length : end;
+				out += command.slice(i, stop);
+				i = stop - 1;
+			} else if (char === "\\" && i + 1 < command.length) {
 				out += "__";
 				i++;
 			} else if (char === "'" || char === '"') {
@@ -359,6 +412,8 @@ function endlessStage(stage: string, isLast: boolean): Omit<EndlessHit, "excerpt
 		case "nvim":
 		case "nano":
 		case "pico":
+			// Ex mode and headless runs are scripts: they read their commands and exit.
+			if (has(/\s(?:-[eE]s|--headless)\s/)) return undefined;
 			return { label: "an editor waits for keys nobody can press", rewrite: "change files with the Edit tool and read them with the Read tool" };
 		case "emacs":
 			if (has(/\s--?batch\s/)) return undefined;
@@ -375,7 +430,7 @@ function endlessStage(stage: string, isLast: boolean): Omit<EndlessHit, "excerpt
 			if (has(/\s-(?:l|b|n)\b/)) return undefined;
 			return { label: "`top` redraws until interrupted", rewrite: "`top -l 1` on macOS or `top -b -n 1` on Linux prints once; `ps aux` also does" };
 		case "tail":
-			if (!isLast || !has(/\s(?:-[A-Za-z0-9]*[fF]\b|--follow\b)/) || has(/\s--pid\b/)) return undefined;
+			if (!isLast || !has(/\s(?:-[A-Za-z0-9]*[fF][A-Za-z0-9]*\b|--follow\b)/) || has(/\s--pid\b/)) return undefined;
 			return { label: "`tail -f` follows until interrupted", rewrite: "read what is there now (`tail -n 50 FILE`); to follow it, run the call with `run_in_background: true`; inside a pipeline that ends (`tail -f FILE | grep -m1 ready`) it is fine" };
 		case "journalctl":
 			if (!isLast || !has(/\s(?:-[A-Za-z]*f\b|--follow\b)/)) return undefined;
@@ -387,7 +442,7 @@ function endlessStage(stage: string, isLast: boolean): Omit<EndlessHit, "excerpt
 			if (!has(/\s(?:infinity|inf)\s/)) return undefined;
 			return { label: "`sleep infinity` never returns", rewrite: "sleep for a number of seconds, or poll a condition in a bounded loop" };
 		case "git":
-			if (has(/\srebase\s(?:.*\s)?(?:-i|--interactive)\s/)) {
+			if (!/(?:^|\s)(?:GIT_SEQUENCE_EDITOR=|(?:-c\s+)?sequence\.editor=)/.test(stage) && has(/\srebase\s(?:.*\s)?(?:-i|--interactive)\s/)) {
 				return { label: "an interactive rebase opens an editor", rewrite: "`git rebase <base>` without `-i`, or script the todo list with `GIT_SEQUENCE_EDITOR`" };
 			}
 			if (has(/\sadd\s(?:.*\s)?(?:-i|-p|--interactive|--patch)\s/)) {
@@ -434,7 +489,7 @@ function endlessStage(stage: string, isLast: boolean): Omit<EndlessHit, "excerpt
 		case "jekyll":
 		case "next":
 		case "vite":
-			if (isLast && has(/^\s(?:run|s|server|serve|dev)\b/)) return { label: "a development server runs until stopped", rewrite: SERVER_HINT };
+			if (isLast && has(/^\s(?:run|s|server|serve|dev)\s/)) return { label: "a development server runs until stopped", rewrite: SERVER_HINT };
 			return undefined;
 		default:
 			return undefined;
@@ -457,16 +512,35 @@ function endlessStage(stage: string, isLast: boolean): Omit<EndlessHit, "excerpt
  * `# pitime-safe` overrides it, and a call made with `run_in_background` never reaches it.
  */
 export function detectEndless(command: string): EndlessHit | undefined {
-	for (const line of maskQuotes(stripHeredocs(command)).split("\n")) {
-		const code = line.replace(/\s+#.*$/, "");
+	const written = stripHeredocs(command);
+	const original = written.split("\n");
+	let inArray = false;
+	for (const [number, line] of maskQuotes(written).split("\n").entries()) {
+		const code = line.replace(/(?:^|\s)#.*$/, "").replace(/(?<![&>|<])&(?![&>])/g, "&;");
+		// The lines of a multi-line array (`editors=(` … `)`) are its members, not commands.
+		if (inArray) {
+			if (code.includes(")")) inArray = false;
+			continue;
+		}
+		if (/[A-Za-z_][A-Za-z0-9_]*\+?=\([^)]*$/.test(code)) {
+			inArray = true;
+			continue;
+		}
 		for (const statement of code.split(/&&|\|\||;/)) {
-			const trimmed = statement.trim();
+			// A `case` label (`vi|vim|nvim)`) is a pattern in front of the statement, not part of it.
+			const trimmed = statement.trim().replace(/^[^\s()]+(?:\s*\|\s*[^\s()]+)*\)\s*/, "");
 			// Backgrounded: the call returns, whatever the process does.
 			if (trimmed === "" || /&\s*$/.test(trimmed)) continue;
 			const stages = trimmed.split(/\|(?!\|)/);
 			for (const [index, stage] of stages.entries()) {
 				const hit = endlessStage(stage, index === stages.length - 1);
-				if (hit) return { ...hit, excerpt: trimmed.length > 60 ? `${trimmed.slice(0, 59)}…` : trimmed };
+				if (hit) {
+					// Masking keeps every character's place, so the statement can be read back as written
+					// (the refusal used to quote `tail -f ______`).
+					const at = line.indexOf(trimmed);
+					const shown = at >= 0 && !code.includes("&;") ? (original[number] ?? trimmed).slice(at, at + trimmed.length) : (original[number] ?? trimmed).trim();
+					return { ...hit, excerpt: shown.length > 60 ? `${shown.slice(0, 59)}…` : shown };
+				}
 			}
 		}
 	}

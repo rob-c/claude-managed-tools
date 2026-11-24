@@ -84,7 +84,9 @@ export function planDeadline(input: DeadlineInput): DeadlinePlan {
 	const wanted = positive(input.defaultSeconds);
 	if (wanted !== undefined) {
 		const most = Math.max(1, Math.floor(ceilingMs / 1000) - HOST_GRACE_SECONDS);
-		const budgetSeconds = Math.min(Math.floor(wanted), most);
+		// Never 0: `run --timeout 0` fires before the command starts, so a default of 0.5s
+		// would end every command at once with a TIMEOUT notice.
+		const budgetSeconds = Math.max(1, Math.min(Math.ceil(wanted), most));
 		return {
 			budgetSeconds,
 			hostTimeoutMs: (budgetSeconds + HOST_GRACE_SECONDS) * 1000,

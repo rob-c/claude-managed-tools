@@ -36,6 +36,8 @@
  * binary path and the environment in, so the same file runs under `node --test`.
  */
 
+import { LIVE_FILE_VAR, LIVE_PRELUDE } from "./live";
+
 /** A bag of environment variables, as the hooks module read them. */
 export type Env = Readonly<Record<string, string | undefined>>;
 
@@ -78,8 +80,12 @@ export interface WrapSettings {
 	unbuffer: boolean;
 	/** Also preload `stdbuf`'s library on Linux, so C-stdio programs line-buffer there too. */
 	preload: boolean;
-	/** Print an offset once per burst: `[= out]` for a line at the offset of the one above. */
+	/** One stamp per burst: a line at the offset and on the stream of the one above carries none. */
 	compactStamps: boolean;
+	/** Decimals an offset keeps in what the model reads (3 is milliseconds; 9 is as captured). */
+	stampDigits: number;
+	/** Show a running command's output and a sign of life under its row, and judge "stuck" by the processor too. */
+	live: boolean;
 	/** Extra `NAME=VALUE` for the wrapped child, from `CLAUDE_MANAGED_TOOLS_EXTRA_ENV`. */
 	extraEnv: Array<[string, string]>;
 }
@@ -207,6 +213,8 @@ export interface WrapDefaults {
 	unbuffer?: boolean;
 	preload?: boolean;
 	compactStamps?: boolean;
+	stampDigits?: number;
+	live?: boolean;
 	extraEnv?: string;
 }
 
@@ -249,8 +257,24 @@ export function readWrapSettings(env: Env = {}, defaults: WrapDefaults = {}, ove
 		unbuffer: readSwitch(env.CLAUDE_MANAGED_TOOLS_UNBUFFER, defaults.unbuffer !== false),
 		preload: readSwitch(env.CLAUDE_MANAGED_TOOLS_PRELOAD, defaults.preload === true),
 		compactStamps: readSwitch(env.CLAUDE_MANAGED_TOOLS_COMPACT_STAMPS, defaults.compactStamps !== false),
+		stampDigits: readStampDigits(env.CLAUDE_MANAGED_TOOLS_STAMP_DIGITS, defaults.stampDigits),
+		live: readSwitch(env.CLAUDE_MANAGED_TOOLS_LIVE, defaults.live !== false),
 		extraEnv: parseExtraEnv(env.CLAUDE_MANAGED_TOOLS_EXTRA_ENV ?? defaults.extraEnv),
 	};
+}
+
+/**
+ * How many decimals of an offset the model is shown: 1 to 9, milliseconds unless set.
+ *
+ * The capture keeps nanoseconds whatever this says (`busybox log` prints them); this is
+ * only how much of the number is repeated in a result. `CLAUDE_MANAGED_TOOLS_STAMP_DIGITS`
+ * overrides the option; anything that is not a whole number from 1 to 9 leaves the default.
+ */
+export function readStampDigits(raw: string | undefined, fallback?: number): number {
+	const isValid = (value: number) => Number.isInteger(value) && value >= 1 && value <= 9;
+	const base = typeof fallback === "number" && isValid(fallback) ? fallback : 3;
+	const asked = (raw ?? "").trim();
+	return asked !== "" && isValid(Number(asked)) ? Number(asked) : base;
 }
 
 /**
@@ -392,7 +416,11 @@ export function isWrapped(command: string): boolean {
 	const trimmed = command.trimStart();
 	if (trimmed.startsWith(CWD_PREAMBLE)) return true;
 	const match = /^(?:busybox|'[^']*\/busybox'|[^'\s]*\/busybox)\s+(\S+)/.exec(trimmed);
-	return match !== null && !RUNNER_APPLETS.includes(match[1] as string);
+	if (match === null || RUNNER_APPLETS.includes(match[1] as string)) return false;
+	// One applet call only: `busybox waitfor … && npm test` is the model's own script, and
+	// used to run with no wrapper, no deadline and no guard.
+	const bare = command.replace(/'\\''/g, "").replace(/'[^']*'/g, "''").replace(/"(?:[^"\\]|\\[\s\S])*"/g, '""').trim();
+	return !/[;&|\n]/.test(bare);
 }
 
 /** What a command ends with to come back unwrapped. Spelled like the guard's `# pitime-safe`. */
@@ -467,6 +495,12 @@ export interface WrapOptions {
 	 * result ("the command's own status is unknown") with what happened. See `exitTrap`.
 	 */
 	report?: boolean;
+	/**
+	 * A file, known to this call alone, in which the command's shell says where its
+	 * capture is and which process group it leads — so the hooks module can show the
+	 * output as it arrives and see whether the processor is in use. See live.ts.
+	 */
+	liveFile?: string;
 }
 
 /** First bytes of a wrapper with an epilogue; `isWrapped` recognises its own output by it. */
@@ -503,7 +537,9 @@ export function exitTrap(shell: string, options: { carryCwd?: boolean; report?: 
 	if (!options.carryCwd && !options.report) return "";
 	const statuses = /(?:^|\/)zsh$/.test(shell) ? "${pipestatus[*]}" : /(?:^|\/)bash$/.test(shell) ? "${PIPESTATUS[*]}" : undefined;
 	const steps: string[] = [];
-	if (options.report && statuses) steps.push(`__pt_ps="${statuses}"`);
+	// In braces with its stderr dropped: under `set -x` the bare assignment printed
+	// `+ __pt_ps=0` into the command's own stderr.
+	if (options.report && statuses) steps.push(`{ __pt_ps="${statuses}"; } 2>/dev/null`);
 	if (options.carryCwd) steps.push(`pwd -P >"$${CWD_FILE_VAR}" 2>/dev/null`);
 	if (options.report) {
 		steps.push(`printf "%s\\n%s\\n" "${statuses ? "$__pt_ps" : ""}" "\${BUSYBOX_RUN_DIR:-}" >"$${FACTS_FILE_VAR}" 2>/dev/null`);
@@ -541,7 +577,7 @@ export const PTY_SIZE = "200x50";
  * capture they would be a line of the command's. The hooks module takes the line back
  * out before anyone reads the result.
  */
-function epilogue(options: { carryCwd?: boolean; report?: boolean }): string {
+function epilogue(options: { carryCwd?: boolean; report?: boolean; liveFile?: string }): string {
 	const steps = ["; __pt_rc=$?"];
 	if (options.carryCwd) steps.push('if [ "$__pt_rc" -eq 0 ] && [ -s "$__pt_f" ]; then cd -- "$(cat "$__pt_f")" 2>/dev/null; fi');
 	if (options.report) {
@@ -549,7 +585,9 @@ function epilogue(options: { carryCwd?: boolean; report?: boolean }): string {
 			`if [ -s "$__pt_f.f" ]; then { IFS= read -r __pt_ps; IFS= read -r __pt_rd; } <"$__pt_f.f"; printf '${FACTS_PREFIX} ps=[%s] dir=%s\\n' "$__pt_ps" "$__pt_rd" >&2; fi`,
 		);
 	}
-	steps.push(`rm -f "$__pt_f"${options.report ? ' "$__pt_f.f"' : ""}`, '(exit "$__pt_rc")');
+	const isTrapped = options.carryCwd === true || options.report === true;
+	const spent = [...(isTrapped ? ['"$__pt_f"'] : []), ...(options.report ? ['"$__pt_f.f"'] : []), ...(options.liveFile ? [shellQuote(options.liveFile)] : [])];
+	steps.push(`rm -f ${spent.join(" ")}`, '(exit "$__pt_rc")');
 	return steps.join("; ");
 }
 
@@ -566,9 +604,11 @@ export function wrapCommand(command: string, options: WrapOptions): string | und
 	if (isWrapped(command) || wantsRaw(command)) return undefined;
 
 	const parts = runPrefix(options);
-	const prelude = (options.pty ?? "off") === "split" ? STDIN_PRELUDE : "";
+	// On the command's own first line, like everything else put in front of it.
+	const prelude = ((options.pty ?? "off") === "split" ? STDIN_PRELUDE : "") + (options.liveFile ? LIVE_PRELUDE : "");
 	const trap = exitTrap(options.shell, options);
-	if (trap === "") {
+	if (options.liveFile) parts.push("--env", shellQuote(`${LIVE_FILE_VAR}=${options.liveFile}`));
+	if (trap === "" && !options.liveFile) {
 		parts.push("--", shellQuote(options.shell), "-c", shellQuote(prelude + command));
 		return parts.join(" ");
 	}
@@ -576,7 +616,7 @@ export function wrapCommand(command: string, options: WrapOptions): string | und
 	if (options.carryCwd) parts.push("--env", `"${CWD_FILE_VAR}=$__pt_f"`);
 	if (options.report) parts.push("--env", `"${FACTS_FILE_VAR}=$__pt_f.f"`);
 	parts.push("--", shellQuote(options.shell), "-c", shellQuote(prelude + trap + command));
-	return CWD_PREAMBLE + parts.join(" ") + epilogue(options);
+	return (trap === "" ? "" : CWD_PREAMBLE) + parts.join(" ") + epilogue(options);
 }
 
 /**
@@ -585,7 +625,7 @@ export function wrapCommand(command: string, options: WrapOptions): string | und
  * Shared by the two ways a command reaches the capture: the wrapper above, which appends
  * the shell and the command, and the shell shim, which appends the host's own line.
  */
-export function runPrefix(options: Omit<WrapOptions, "shell" | "carryCwd" | "report">): string[] {
+export function runPrefix(options: Omit<WrapOptions, "shell" | "carryCwd" | "report" | "liveFile">): string[] {
 	const ladder = LADDER[options.verbosity];
 	const env = options.noEnv ? [] : envFlags(options);
 	const parts = [shellQuote(options.busybox), "run"];
@@ -639,7 +679,7 @@ function inDoubleQuotes(value: string): string {
  * Claude Code's own shell for a tool call, `/bin/sh` in the shim for a `!` command. The
  * person's extra environment comes last, and the last assignment of a name wins.
  */
-function envFlags(options: Omit<WrapOptions, "shell" | "carryCwd" | "report">): string[] {
+function envFlags(options: Omit<WrapOptions, "shell" | "carryCwd" | "report" | "liveFile">): string[] {
 	const isUnbuffered = options.unbuffer !== false;
 	const assign = ([name, value]: readonly [string, string]) => shellValue(`${name}=${value}`);
 	const append = (name: string, value: string) => `"${name}=\${${name}:+$${name} }${inDoubleQuotes(value)}"`;

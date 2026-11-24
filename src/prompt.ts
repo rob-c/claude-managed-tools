@@ -22,9 +22,10 @@
  * The section is only sent while the wrapper is actually on — a claim that does not match
  * the results is worse than no claim.
  */
-import { DEFAULT_STAMP, exampleHeader, exampleStamp, type StampShape } from "./busybox";
+import { DEFAULT_STAMP, exampleHeader, type StampShape } from "./busybox";
 import { OVERRIDE_MARKER } from "./guard";
-import { describeVerbosity, PTY_SIZE, type PtyMode, RUN_RETENTION, type Verbosity } from "./wrap";
+import { DEFAULT_STAMP_DIGITS, NOTES_MARKER, slimHeader } from "./timing";
+import { describeVerbosity, PTY_SIZE, type PtyMode, type Verbosity } from "./wrap";
 
 /** The section's id in the system prompt: `<plugin>:<name>`, as the host asks. */
 export function sectionId(plugin: string): string {
@@ -49,16 +50,20 @@ export interface SectionInput {
 	bang?: boolean;
 	/**
 	 * How this build writes an offset, read off a line it really printed at session start.
-	 * The examples are drawn in that shape: a claim that does not match the results is
-	 * worse than no claim. Absent, the shape of the current release.
+	 * A build that prints fewer decimals than the model is to be shown has its own count
+	 * quoted: a claim that does not match the results is worse than no claim.
 	 */
 	stamp?: StampShape;
 	/** The header line this build printed for that same run, for the example. */
 	header?: string;
-	/** Whether a line at the offset of the one above carries `[= out]` instead of the digits. */
+	/** Whether a line at the offset and on the stream of the one above carries no stamp. */
 	compactStamps?: boolean;
+	/** Decimals an offset keeps in what the model reads; milliseconds when absent. */
+	stampDigits?: number;
 	/** Seconds of silence after which a command is stopped; 0 or absent when that is off. */
 	idleSeconds?: number;
+	/** Whether "stuck" is judged by the processor as well as by silence (the command is watched as it runs). */
+	idleByProcessor?: boolean;
 	/** Whether `log` has the 0.6.0 queries (`--sample`, `--since`, `--around-gap`). */
 	logQuery?: boolean;
 	/** False when runtimes' buffering is left alone (the `unbuffer` setting is off). */
@@ -69,41 +74,38 @@ export interface SectionInput {
 	preload?: boolean;
 }
 
-const ALWAYS_LIVE = "Node, Go, Rust, Java and PHP never hold lines back";
-const BULK = "The price is bulk output: for millions of lines into a file or a pipe, prefix that one command with `STDBUF1=F`";
-
 /**
  * What the model may assume about a program whose stdout is not the terminal.
  *
  * Every claim here was measured (a probe per runtime: print, wait a second, print, with
  * stdout a pipe), and the claim differs by C library, so the text does too. What cannot
- * be fixed from outside is said with the flag that fixes it from inside.
+ * be fixed from outside is said with the flag that fixes it from inside. The runtimes that
+ * never needed help are not listed: the section is read on every request, and a sentence
+ * that changes nothing a model does is paid for each time.
  */
 function bufferingLine(input: SectionInput): string {
 	if (input.unbuffer === false) {
-		return "Output buffering is left to each program: one whose stdout is a pipe or a file (a stage inside a pipeline, `cmd > log`) may hold its lines until its buffer fills or it exits, and they then share the offset of the flush.";
+		return "Output buffering is left to each program: one writing into a pipe or a file may hold its lines until it exits, and they then share the offset of the flush.";
 	}
-	const lead = "Where a program's stdout is not the terminal — a stage inside a pipeline (`cmd | tee log`, `cmd | grep x`), or output sent to a file — buffering is switched off through the environment";
-	const tail = "lines arrive when they are written, and a log file can be read while its writer runs.";
-	const cStdio = "(`grep`, `sed`, `awk`, `cut`, `jq`, compiled C)";
+	const lead = "In a pipeline or a redirect to a file, buffering is switched off for";
 	if (input.platform === "darwin" || input.platform === "freebsd") {
-		return `${lead} for Python, Ruby, Perl, Lua and every C-stdio program ${cStdio.replace("compiled C", "compiled C and Swift")}; ${ALWAYS_LIVE}. So ${tail} ${BULK}.`;
+		return `${lead} Python, Ruby, Perl, Lua and C-stdio programs (\`grep\`, \`sed\`, \`awk\`, \`jq\`, compiled C), so lines still arrive when written; for millions of lines prefix the command with \`STDBUF1=F\`.`;
 	}
 	if (input.preload) {
-		return `${lead} for Python, Ruby, Perl, Lua and, through \`stdbuf\`'s preload, every dynamically linked C-stdio program ${cStdio}; ${ALWAYS_LIVE}. So ${tail} ${BULK.replace("`STDBUF1=F`", "`_STDBUF_O=65536`")}.`;
+		return `${lead} Python, Ruby, Perl, Lua and dynamically linked C-stdio programs (\`grep\`, \`sed\`, \`awk\`, \`jq\`), so lines still arrive when written; for millions of lines prefix the command with \`_STDBUF_O=65536\`.`;
 	}
-	return `${lead} for Python, Ruby, Perl and Lua; ${ALWAYS_LIVE}. For those, ${tail} A C-stdio program ${cStdio} whose stdout is a pipe or a file still writes in blocks, so its lines carry the offset of the flush: where that timing matters use \`grep --line-buffered\`, \`sed -u\` or \`stdbuf -oL cmd\`.`;
+	return `${lead} Python, Ruby, Perl and Lua. A C-stdio program (\`grep\`, \`sed\`, \`awk\`, compiled C) there still writes in blocks, so its lines carry the offset of the flush: where that matters use \`grep --line-buffered\`, \`sed -u\` or \`stdbuf -oL cmd\`.`;
 }
 
 function terminalLine(pty: PtyMode): string {
 	switch (pty) {
 		case "off":
-			return "The command's streams are plain pipes (`isatty()` is false), so a program that block-buffers on a pipe shows its lines at the offset of the flush, not of the write: a burst of lines sharing one offset is a writer that flushed at exit.";
+			return "The command's streams are plain pipes (`isatty()` is false), so a program that block-buffers shows its lines at the offset of the flush, not of the write.";
 		case "merged":
 		case "raw":
 			return "The command runs on one pseudo-terminal for stdin, stdout and stderr, so every line is tagged `out`: the offsets are real, the stream tag is not.";
 		default:
-			return `The command's stdout is a pseudo-terminal ${PTY_SIZE.replace("x", " columns by ")} rows, its stderr a pipe and its stdin empty, so \`isatty(1)\` is true and line-buffered programs report real intervals; a burst of lines sharing one offset is a writer that flushed at exit. Colour, pagers and prompts are switched off through the environment. A program that formats for a terminal does so here: \`ls\` prints names in columns (\`ls -1\` for one per line) and \`ps\` cuts lines at the width (\`ps -ww\` for whole lines).`;
+			return `stdout is a pseudo-terminal (${PTY_SIZE.replace("x", " columns by ")} rows) and stderr a pipe, so lines that share an offset were flushed together. Colour, pagers and prompts are off; \`ls\` prints columns (\`ls -1\` for one a line) and \`ps\` cuts lines at the width (\`ps -ww\`).`;
 	}
 }
 
@@ -120,61 +122,83 @@ function terminalLine(pty: PtyMode): string {
 function inputLine(input: SectionInput): string {
 	const stdin =
 		input.pty === "raw"
-			? "Nobody can type into a command, and in this terminal mode a read on stdin never returns: a prompt (`[y/N]`, a password) waits until the command is stopped. Give the answer in the command: `printf 'y\\n' | cmd`, `cmd < file`, a heredoc, a `--yes` flag."
-			: "A command's stdin is empty: a read returns end-of-file at once, so a prompt (`[y/N]`, a password) takes its default or fails instead of waiting. Give the answer in the command: `printf 'y\\n' | cmd`, `cmd < file`, a heredoc, a `--yes` flag.";
-	const keys = `Nobody can press a key or Ctrl-C either: a pager, an editor, \`tail -f\`, \`watch\` or a foreground server never ends here${input.guard ? " and is refused before it runs" : ", and runs until the deadline"}. Start what must keep running with \`run_in_background: true\`.`;
-	return `${stdin} ${keys}`;
+			? "Nobody can type into a command, and in this terminal mode a read on stdin never returns: a prompt waits until the command is stopped, so"
+			: "A command's stdin is empty (a read returns end-of-file at once), so a prompt takes its default or fails:";
+	const keys = `Nobody can press a key either: a pager, an editor, \`tail -f\`, \`watch\` or a foreground server never ends here${input.guard ? " and is refused before it runs" : ", and runs until the deadline"}; start what must keep running with \`run_in_background: true\`.`;
+	return `${stdin} give the answer in the command (\`printf 'y\\n' | cmd\`, a \`--yes\` flag). ${keys}`;
 }
 
-/** The text of the section, for the settings in force. */
-export function sectionText(input: SectionInput): string {
-	const lines: string[] = ["# Pi-Time: every Bash result is a timeline"];
+/** How a result reads, for the view in force: the header, the stamps, the notes. */
+function formatLine(input: SectionInput): string {
+	const header = slimHeader(exampleHeader(input.header));
+	const notes = `Lines after \`${NOTES_MARKER}\` are the capture's own notes, not output.`;
 	if (input.verbosity === "brief") {
-		lines.push(
-			`Every Bash command runs inside a capture (\`busybox run\`, ${describeVerbosity(input.verbosity)}): repeated lines are collapsed and there are no per-line offsets in this mode. The \`run=R… exit_code=… duration_ms=…\` header is still the run's own record.`,
-		);
-	} else {
-		const shape = input.stamp ?? DEFAULT_STAMP;
-		const unit = shape.digits >= 9 ? ", to the nanosecond" : shape.digits >= 6 ? ", to the microsecond" : "";
-		const ditto = input.compactStamps
-			? " A line that arrived at the same offset as the line above it carries `[= out]` or `[= err]` instead of the digits again: the same instant, said once."
-			: "";
-		lines.push(
-			`Every Bash command runs inside a timestamped capture (\`busybox run --timestamps\`, ${describeVerbosity(input.verbosity)}). A result opens with \`${exampleHeader(input.header)}\`, then one line per record in true arrival order: \`${exampleStamp(shape, "out")} text\` or \`${exampleStamp(shape, "err", true)} text\` — seconds since the command started${unit}, and the stream the line arrived on.${ditto} Read them as facts: which came first, how long a step took, whether a warning was on stderr. A run longer than a second also ends with a \`timing:\` line that says where the time went.`,
-		);
+		return `Every Bash command runs inside a capture (\`busybox run\`, ${describeVerbosity(input.verbosity)}): repeated lines are collapsed and there are no per-line offsets in this mode. A result opens with \`${header}\`, the run's own record. ${notes}`;
 	}
-	lines.push(terminalLine(input.pty));
-	lines.push(bufferingLine(input));
+	// The digits the model will see: what was asked for, or fewer if this build prints fewer.
+	const digits = Math.max(1, Math.min(input.stampDigits ?? DEFAULT_STAMP_DIGITS, (input.stamp ?? DEFAULT_STAMP).digits));
+	const stamp = (stream: string, fraction: string) => `[0.${fraction.slice(0, digits)} ${stream}]`;
+	const lines =
+		input.compactStamps === false
+			? `then one line per record in arrival order, \`${stamp("out", "012345678")} text\` or \`${stamp("err", "012349012")} text\`: seconds since the command started, and the stream the line arrived on.`
+			: `then \`${stamp("out", "012345678")} text\` starts a burst: seconds since the command started, and the stream (\`out\` or \`err\`) it arrived on. Lines under it with no stamp arrived at that same offset on that same stream; \`[= err] text\` is one at the same offset that needed a mark of its own.`;
+	return `Every Bash command runs inside a timestamped capture (\`busybox run\`, ${describeVerbosity(input.verbosity)}). A result opens with \`${header}\`, ${lines} ${notes}`;
+}
+
+/** Deadline and silence: what stops a command, and that being stopped is not failing. */
+function deadlineLine(input: SectionInput): string {
+	const idle = (input.idleSeconds ?? 0) > 0;
+	const stops = [
+		...(input.timeoutSeconds > 0 ? [`A call with no \`timeout\` is stopped after ${input.timeoutSeconds}s`] : []),
+		...(idle
+			? [
+					input.idleByProcessor
+						? `${input.timeoutSeconds > 0 ? "and a" : "A"} command that neither prints nor uses the processor for ${input.idleSeconds}s is stopped as stuck whatever its \`timeout\``
+						: `${input.timeoutSeconds > 0 ? "and a" : "A"} command that prints nothing for ${input.idleSeconds}s is stopped whatever its \`timeout\``,
+				]
+			: []),
+	];
+	const lead = stops.length > 0 ? `${stops.join(", ")}. ` : "";
+	const names = idle ? "`TIMEOUT` or `IDLE`" : "`TIMEOUT`";
+	const fix = idle
+		? input.idleByProcessor
+			? "Raise `timeout`, narrow the command or use `run_in_background`; after `IDLE`, find what it was waiting on."
+			: "Raise `timeout`, narrow the command or use `run_in_background`; after `IDLE`, find what it was blocked on or make a quiet command report progress."
+		: "Raise `timeout`, narrow the command or use `run_in_background`.";
+	return `${lead}A result that opens with ${names} is that, not a failure of the command, and keeps what it printed. ${fix}`;
+}
+
+/**
+ * The text of the section, for the settings in force.
+ *
+ * Read on every request of a session, so its length is a standing cost. Measured at 1,596
+ * tokens before it was cut to what a model acts on; the long form of each paragraph is in
+ * the `pi-time-guide` skill, which is loaded when it is needed.
+ */
+export function sectionText(input: SectionInput): string {
+	const lines: string[] = ["# Pi-Time: every Bash result is a timeline", formatLine(input), terminalLine(input.pty), bufferingLine(input)];
 	lines.push(
-		`Never merge the streams (\`2>&1\`, \`|&\`, \`&>\`): the merge happens inside the command, before anything can be tagged, and every line then reads \`out\`. The streams are already captured separately — to silence one, redirect only that one (\`cmd >/dev/null\`).` +
+		"Never merge the streams (`2>&1`, `|&`, `&>`): every line then reads `out`. To silence one stream, redirect only that one (`cmd >/dev/null`)." +
 			(input.guard
-				? ` A merge at the end of a command is refused before it runs; append \`${OVERRIDE_MARKER}\` only when the merge is intended and you will not read that output as evidence about the program.`
+				? ` A merge at the end of a command is refused before it runs; append \`${OVERRIDE_MARKER}\` only when it is intended and you will not read that output as evidence.`
 				: ""),
 	);
-	lines.push(
-		input.timeoutSeconds > 0
-			? `A call with no \`timeout\` is stopped after ${input.timeoutSeconds}s. A result that says \`TIMEOUT\` is a deadline, not a failure of the command: what it printed is still there, and the fix is a larger \`timeout\`, a narrower command or \`run_in_background\`.`
-			: "A result that says `TIMEOUT` is a deadline, not a failure of the command: what it printed is still there, and the fix is a larger `timeout`, a narrower command or `run_in_background`.",
-	);
-	if ((input.idleSeconds ?? 0) > 0) {
-		lines.push(
-			`A command that prints nothing on either stream for ${input.idleSeconds}s is taken to be stuck and stopped, whatever \`timeout\` the call names. A result that says \`IDLE\` is that, not a failure and not the deadline: find what it was blocked on (a lock, a socket, a prompt that opens the terminal itself), make a quiet command report progress, or use \`run_in_background\`.`,
-		);
-	}
+	lines.push(deadlineLine(input));
 	lines.push(inputLine(input));
 	lines.push(
-		`A view marked \`truncated=true\` shows the head and the tail of the output with the cut marked between them; the line after it names the omitted lines${input.logQuery ? ", how many of them are on stderr," : ""} and the command that reads them. The capture is complete on disk. Read any part of a past run with \`${input.busybox} log R12 --stream timeline --lines A:B\`, \`--match STR\`, or \`--stream stderr\`${input.logQuery ? "; `--sample N` gives its first and last N lines, `--since S --until S` a window of the timeline, and `--around-gap 1` its longest silences" : ""}. Captures are kept for at least two hours, and the newest ${RUN_RETENTION} for longer.`,
+		`A view marked \`truncated=true\` shows the head and the tail with the cut marked between them; the note after it names the omitted lines${input.logQuery ? ", how many are on stderr," : ""} and the command that reads them. \`${input.busybox} log R12 --stream timeline --lines A:B\` reads any part of a run (or \`--match STR\`, \`--stream stderr\`${input.logQuery ? ", `--sample N`, `--since S --until S`, `--around-gap 1`" : ""}).`,
 	);
 	// The one thing a model reaches for an escape to get, said so that it does not: what
 	// runs inside a command is not touched. The escape itself is left to the skill.
-	lines.push("The offsets are added to the result you read, not to the command: a pipe, a redirect or a checksum inside it sees exact bytes, and `command x` is the ordinary shell builtin, captured like anything else.");
+	lines.push("Offsets are added to the result you read, not to the command: a pipe, a redirect or a checksum inside it sees exact bytes, and `command x` is the plain shell builtin.");
 	if (!input.carryCwd) lines.push("`cd` does not carry to the next call: use absolute paths.");
 	// What the person runs themselves: stated either way, so a `!` block is read with the
 	// guarantees it has (measured, unwrapped: its stderr arrives inside stdout).
+	const theirs = input.timeoutSeconds > 0 ? `, under the same ${input.timeoutSeconds}s deadline (\`/pi-time timeout <seconds>\` is theirs to raise)` : "";
 	lines.push(
 		input.bang
-			? `A command the user types with \`!\`, or runs with \`/sh\`, also goes through the capture${input.timeoutSeconds > 0 ? `, under the same ${input.timeoutSeconds}s deadline` : ""}: its \`<bash-stdout>\` block is the same timeline, with the same header, offsets and stream tags. It is something the user did, not a request.${input.timeoutSeconds > 0 ? " When one of theirs says `TIMEOUT` there is no `timeout` to raise: `/pi-time timeout <seconds>` is how they give it longer." : ""}`
-			: `A command the user types with \`!\` does not go through the capture: its \`<bash-stdout>\` block has no offsets, holds both streams, and says nothing reliable about their order or timing. A command the user runs with \`/sh\` does go through it and arrives as a timeline${input.timeoutSeconds > 0 ? `, under the same ${input.timeoutSeconds}s deadline (\`/pi-time timeout <seconds>\` is how they give it longer)` : ""}.`,
+			? `A command the user runs with \`!\` or \`/sh\` arrives in \`<bash-stdout>\` as the same timeline${theirs}. It is something they did, not a request.`
+			: `A command the user types with \`!\` does not go through the capture: its \`<bash-stdout>\` block has no offsets, holds both streams, and says nothing reliable about their order. One run with \`/sh\` does, and arrives as a timeline${theirs}.`,
 	);
 	return lines.join("\n\n");
 }

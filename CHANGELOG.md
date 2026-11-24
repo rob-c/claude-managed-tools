@@ -1,5 +1,182 @@
 # Changelog
 
+## [0.7.0] - 2026-11-24
+
+A running command is no longer a blank row, and "stuck" is no longer another word for
+"quiet".
+
+### Added
+
+- **Live output and a sign of life under a running command.** `busybox run` prints its
+  view when the command ends, so a slow command showed nothing for as long as it took.
+  The capture's own files grow as the command writes (measured: first bytes there within
+  a second, the view only at exit), so the plugin reads them and draws the newest lines
+  under the command's row, with one line beneath:
+  `running 47s · last output 31s ago · CPU busy (98% of a processor): working`, or
+  `CPU idle: waiting on something (stopped as stuck in 45s if it stays so)`.
+  The command's shell says where its capture is and which process group it leads, in one
+  small file named to it alone; nothing is read for the first second and a half, so a
+  quick command pays nothing. The model is sent none of it. Option `live`,
+  `CLAUDE_MANAGED_TOOLS_LIVE`.
+- **The processor is read while a command runs**: `ps` for the command's own process
+  group, every three seconds. Measured on a silent loop: 1.02 s of CPU after one second,
+  2.04 s after two; a blocked command shows none.
+- **A deadline says whether more time would have helped.** On a watched command the
+  `TIMEOUT` notice carries a line from the processor: "it used 117.3s of processor time in
+  120s and was still computing when it was stopped, so it was working, not stuck", or
+  "…and none at the end, so it was waiting on something, not computing: more time alone
+  will not help".
+
+### Changed
+
+- **A command is stuck when it has shown no sign of life: neither a line nor processor
+  time.** Silence alone used to decide, and it stopped a quiet compile along with a hang.
+  A command that is using a hundredth of a processor or more over its silence is now left
+  alone, up to its deadline; one that is using none is stopped at the silence limit as
+  before, and its `IDLE` notice says both things: "for 121s it printed nothing and used no
+  processor time to speak of (0.0s), so it was waiting, not working".
+- **The hooks module enforces that limit**, since the capture's own (`--idle-timeout`)
+  knows only output. It stops the command's whole process group, asks once, and kills it
+  outright three seconds later if it is still there; only a group that `ps` listed a
+  moment before is ever signalled.
+- **Where a command cannot be watched, nothing changes.** In Claude Code's sandbox the
+  command's shell cannot write its report; after the first such call the plugin stops
+  trying, those calls get the capture's own silence limit again, and the system prompt
+  says "prints nothing" rather than "neither prints nor uses the processor". A `!` or
+  `/sh` command of your own uses the capture's limit too.
+
+### Removed
+
+- The README's caveat about the maturity of the hook API.
+
+### Costs
+
+- One small file per call in the plugin's data folder, written by the command's shell and
+  removed by the `rm` that already tidied up after it.
+- While a command runs past a second and a half: two `stat` calls twice a second, and one
+  `ps` every three seconds.
+- A command that polls quietly — a loop with a `sleep` in it — uses a little processor
+  and so counts as alive: it runs to its deadline rather than to the silence limit.
+
+### Checked, and not
+
+- With the engine's test kit and a clock the tests move: the row's text as output arrives,
+  a hang stopped at the limit with its group signalled once and then killed, a silent
+  command at a whole processor left alone for three times the limit, nothing signalled
+  that `ps` did not list, and the fallback when a command never reports itself.
+- In a live headless session with the limit set to 8 s: a silent command at a whole
+  processor ran its 16 s and finished; `sleep 40` came back after 9 s as `IDLE` ("printed
+  nothing and used no processor time to speak of"); a busy command past its deadline came
+  back as `TIMEOUT` with "still computing when it was stopped". The folder of reports was
+  empty afterwards.
+- Not seen: the row itself drawn in a terminal. A headless session draws nothing, so the
+  drawing is verified by the test kit only. Not run: Linux (`ps` prints CPU time in
+  another spelling there, which is parsed and unit-tested, and to the second), the
+  sandbox.
+
+## [0.6.1] - 2026-11-24
+
+Thirty-nine reproduced defects, ported from a bug hunt in pi-managed-tools: statements to
+Claude that were false, and harmless commands a guard refused. `tests/claims.test.ts` holds
+one case per item.
+
+### Fixed
+
+- **A discard is not a merge.** `cmd >/dev/null 2>&1` and `cmd &>/dev/null` were refused
+  "because the timeline loses the [err] tag", though nothing reaches the view. They run,
+  with a note that both streams were discarded. A merge into a file (`>srv.log 2>&1`) and
+  `2>&1 >/dev/null` (stderr to the view) are still refused.
+- **Text that mentions a merge is not one.** `grep -n "2>&1" f`, `git commit -m "ban 2>&1"`,
+  a comment and a heredoc body were all refused; a quoted `# pitime-safe` switched the guard
+  off.
+- **The endless-command guard read data as commands.** Refused though they end:
+  `server & sleep 1; curl …; kill %1`, a comment line with `watch` in it, an apostrophe in a
+  comment, `vim -es`, `nvim --headless`, `rails dev:cache`, the members of a multi-line
+  array, the labels of a `case`, and the guard's own advice
+  (`GIT_SEQUENCE_EDITOR=… git rebase -i`). Let through though endless: `tail -fn 5 f`, and a
+  `tail -f` after a comment with an apostrophe or after a here-string. A refusal now quotes
+  the command as written, not a masked copy (`tail -f ______`).
+- **Only the first line of a result is its header.** A command that printed a `run=R…` line
+  of its own (a saved result, `busybox log R --summary`) was taken for that run and given its
+  TIMEOUT or KILLED notice. The host's own `Exit code N` line may still come first.
+- **The timing digest.** It invented a pause across a truncated view (400 lines 10 ms apart
+  read "longest pause 5.24s"), dropped a pause when there was also a silence at the end, and
+  said nothing about one line followed by five silent seconds.
+- **Notes follow what the shell ran.** "A process was left running" appeared after the
+  command had killed it and was missing for `sleep 2 & echo started`. "The pipeline ends in
+  `tail`" appeared with no pipe (`tail -n 2 f`, `make || tail -5 log`, a quoted
+  `"a|tail"`). "stdout was discarded" appeared for a string that merely mentioned
+  `>/dev/null` (a nested `sh -c '… 2>/dev/null'` still counts).
+- **A compound command starting with `busybox`** (`busybox waitfor … && npm test`) ran with
+  no capture, no deadline and no guard.
+- **The exit trap printed `+ __pt_ps=0`** into a command's stderr under `set -x`.
+- **A default deadline under one second** became `--timeout 0`, which fires before the
+  command starts.
+
+## [0.6.0] - 2026-11-24
+
+What the plugin costs in tokens, measured and cut. Everything it adds to a result is read
+by the model and stays in the conversation for every later turn; the section it adds to
+the system prompt is read on every request.
+
+Measured with the API's own count on 60 results from real sessions (1,816 lines of output,
+45,700 tokens of the commands' own text):
+
+| | Tokens the plugin added | Per result | On top of the output |
+|---|---|---|---|
+| 0.4.1 | 24,500 | 408 | 54% |
+| 0.5.0 | 19,000 | 317 | 42% |
+| 0.6.0 | 6,200 | 103 | 14% |
+
+### Changed
+
+- **A stamp starts a burst; the lines under it carry none.** A full stamp,
+  `[0.030555209 out] `, is about ten tokens: digits are expensive. Over 13,616 stamped
+  lines from 416 results, 54% share their offset with the line above to the nanosecond and
+  86% to the millisecond. A line at the same offset and on the same stream as the line
+  above it is now written bare. One at the same offset that needs a mark — the stream
+  changed, or its own text begins with `[` or has the shape of a line the capture prints —
+  reads `[= err] text`. Every change of stream is therefore still marked. This is what
+  `compactStamps` means now; off puts a stamp on every line.
+- **Offsets are to the millisecond**, cut and never rounded up, and never padded. The
+  capture keeps nanoseconds and `busybox log` prints them. `stampDigits` (1 to 9,
+  `CLAUDE_MANAGED_TOOLS_STAMP_DIGITS`) sets the decimals.
+- **The header is one line.** `run=R12 exit_code=0 duration_ms=328` where there were three
+  lines: 20 tokens a call instead of 76. A flag is printed only when it is true, the line
+  counts only when the view was cut, and `--- timeline ---` not at all. Four results in
+  ten are under 600 characters; for those the header was half the text. The sectioned view
+  (`brief`) keeps its section markers and loses its two artifact paths.
+- **The notes follow a line `--- pi-time ---`.** With most output lines bare, the digest,
+  the pointer into a cut view and the notes need one line in front of them to be told
+  from output.
+- **The system prompt section is a third shorter**: 1,068 tokens from 1,596, with every
+  fact kept and the long form of each left to the skill. The skill's description, also
+  always in context, is 171 tokens from 271.
+- **The truncation pointer names the binary once**, not three times: its path alone is
+  about twenty tokens.
+
+### How the new spelling was checked
+
+- **That it can be read.** Before it was adopted, Claude Haiku was asked eight questions
+  with known answers about one result — which stream a line arrived on, at what offset, how
+  long between two lines, whether a line was output or a note — in four spellings. All
+  eight were right in every run: five runs in this spelling, four in each of the others.
+  One small result and one model: it shows the spelling can be read, not that it always is.
+- **That it loses nothing but the decimals.** `expandStamps` gives every line of a
+  compacted result its stamp back, and the tests hold the two to be equal.
+- **That every reader of a stored result still works.** The digest, the truncation pointer
+  and the outcome notices are worked out on the capture as `run` printed it, before it is
+  respelled; the person's row strips both spellings to the same lines.
+
+### Costs
+
+- A model reading a long burst has to look up for its stamp: a line no longer says its own
+  stream.
+- Two events inside one millisecond show the same offset. Their order is still the order
+  of the lines; their interval needs `busybox log`, or `stampDigits`.
+- A result with nothing after the output looks the same as before to a reader who does not
+  know the format; one who does is told the notes begin at `--- pi-time ---`.
+
 ## [0.5.0] - 2026-11-24
 
 What pi-managed-tools 0.23.0's hardening pass found, applied here: each item was a thing
