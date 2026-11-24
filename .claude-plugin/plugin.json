@@ -1,0 +1,110 @@
+{
+	"name": "managed-tools",
+	"version": "0.5.0",
+	"description": "Pi-Time for Claude Code: every Bash result comes back as a timeline — which stream each line arrived on, when, and a named TIMEOUT instead of a hang.",
+	"author": {
+		"name": "Robert Currie",
+		"url": "https://github.com/rob-c"
+	},
+	"homepage": "https://github.com/rob-c/claude-managed-tools#readme",
+	"repository": "https://github.com/rob-c/claude-managed-tools",
+	"license": "GPL-2.0-only",
+	"keywords": ["pi-time", "bash", "timeline", "timestamps", "busybox", "stderr", "timeout"],
+	"network": {
+		"hosts": ["api.github.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"]
+	},
+	"userConfig": {
+		"enabled": {
+			"type": "boolean",
+			"title": "Wrap Bash commands",
+			"description": "Run every foreground Bash command inside a timestamped capture, so its result is a timeline. Off leaves Bash exactly as Claude Code runs it.",
+			"default": true
+		},
+		"verbosity": {
+			"type": "string",
+			"title": "View size",
+			"description": "How much of a command's output comes back: quiet is a 6 KB timeline, normal 24 KB, verbose 27 KB (the most Claude Code shows inline); brief collapses repeated lines and drops the per-line timing.",
+			"default": "normal",
+			"options": ["quiet", "normal", "verbose", "brief"]
+		},
+		"pty": {
+			"type": "string",
+			"title": "Terminal for the command",
+			"description": "split puts stdout on a pseudo-terminal so programs print each line as it happens, and keeps stderr on a pipe so it stays tagged; off is plain pipes (byte-exact, no tty); merged gives stdin, stdout and stderr one terminal; raw is merged with the line discipline off.",
+			"default": "split",
+			"options": ["split", "off", "merged", "raw"]
+		},
+		"timeoutSeconds": {
+			"type": "number",
+			"title": "Default deadline (seconds)",
+			"description": "Every command with no timeout of its own is stopped after this long and comes back as a named TIMEOUT with what it printed: a Bash call that names none, and the commands you run yourself with ! or /sh. 0 leaves Claude Code's own default in charge of Bash calls and puts no deadline on your own commands. /pi-time timeout <seconds|off> changes it for one session.",
+			"default": 120
+		},
+		"idleSeconds": {
+			"type": "number",
+			"title": "Stop a silent command after (seconds)",
+			"description": "Stop a command that prints nothing on either stream for this long, whatever its deadline, and return it as a named IDLE with what it printed. It matters when a call raises its timeout: a command given ten minutes that hangs at once comes back after this long instead. A command that is quiet and working is stopped too (a silent compile, a sleep); 0 turns the limit off, and /pi-time idle <seconds|off> changes it for one session. Needs busybox-static 0.6.0 or later.",
+			"default": 120
+		},
+		"unbuffer": {
+			"type": "boolean",
+			"title": "Switch output buffering off",
+			"description": "Set the variables that make programs write each line when they print it, so a stage inside a pipeline (cmd | tee log) and output sent to a file carry true timing: Python, Ruby, Perl and Lua everywhere, and on macOS every C-stdio program (grep, sed, awk, jq, compiled C and Swift) through STDBUF1=L. The cost is bulk output: millions of lines into a file take several times longer line by line. Off leaves every program's buffering as it is. To exempt one variable, name it in Extra environment (STDBUF1=F).",
+			"default": true
+		},
+		"preloadStdbuf": {
+			"type": "boolean",
+			"title": "Linux: preload stdbuf's library",
+			"description": "On Linux the C library reads no variable for buffering, so grep, sed, awk and compiled C still write in blocks into a pipe. This preloads GNU coreutils' libstdbuf.so (what stdbuf -oL does) into every command so they line-buffer too. Off by default because a preload reaches every program a command starts: an AddressSanitizer build, for one, refuses to run with it. No effect on macOS, where STDBUF1 already does this.",
+			"default": false
+		},
+		"autoUpdate": {
+			"type": "boolean",
+			"title": "Keep busybox at the latest release",
+			"description": "Once a day at most, ask GitHub for the latest rob-c/busybox-static release and, if it differs from the plugin's own copy, download this machine's build (macOS universal, Linux amd64 or arm64), check it against the published sha256, and switch to it. Off leaves the binary alone until you run /pi-time update.",
+			"default": true
+		},
+		"compactStamps": {
+			"type": "boolean",
+			"title": "Print an offset once per burst",
+			"description": "A line that arrived at the same offset as the line above it carries [= out] instead of the digits again. Output mostly arrives in bursts, where every line would repeat the same number; the stream tag stays on every line. Off prints the full offset on every line.",
+			"default": true
+		},
+		"guard": {
+			"type": "boolean",
+			"title": "Refuse commands that cannot work here",
+			"description": "Refuse two kinds of command before they run, and tell the model what to write instead: one that ends in 2>&1, |& or &> (the merge erases the stderr tag the timeline exists to carry), and one that cannot end on its own (a pager, an editor, tail -f, watch, a foreground server), which would only run to the deadline. Appending # pitime-safe to a command lets it through.",
+			"default": true
+		},
+		"carryCwd": {
+			"type": "boolean",
+			"title": "Keep cd between calls",
+			"description": "Carry a successful command's final directory back to Claude Code's shell, as an unwrapped Bash call does.",
+			"default": true
+		},
+		"wrapBang": {
+			"type": "boolean",
+			"title": "Wrap your own ! commands",
+			"description": "Run a command you type with ! in your shell inside the capture, so Claude reads it as a timeline too. This points Claude Code's shell (CLAUDE_CODE_SHELL, for this session) at a small shim that is your real shell for everything else. To tell a ! command from other shell launches it keeps a hash of the prompt box's text in the plugin's data folder; the text itself is never written. Off leaves ! exactly as Claude Code runs it; /sh still works.",
+			"default": true
+		},
+		"cleanDisplay": {
+			"type": "boolean",
+			"title": "Show the command's own output on screen",
+			"description": "Draw a Bash result without the timeline prefixes and the wrapper's header. The model still reads the full timeline; off shows you exactly what it reads.",
+			"default": true
+		},
+		"busybox": {
+			"type": "string",
+			"title": "Path to busybox",
+			"description": "Absolute path to a rob-c/busybox-static build, for a local build that should win over the release. Empty uses the copy this plugin keeps in its own data folder, and failing that the one in ~/.pi/agent/bin.",
+			"default": ""
+		},
+		"extraEnv": {
+			"type": "string",
+			"title": "Extra environment",
+			"description": "NAME=VALUE pairs, comma separated, set for every wrapped command after the wrapper's own variables, so a pair here wins over a default (STDBUF1=F gives C-stdio programs their block buffer back).",
+			"default": ""
+		}
+	}
+}

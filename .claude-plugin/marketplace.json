@@ -1,0 +1,12 @@
+{
+	"name": "rob-c",
+	"description": "Robert Currie's Claude Code plugins.",
+	"owner": { "name": "Robert Currie" },
+	"plugins": [
+		{
+			"name": "managed-tools",
+			"source": "./",
+			"description": "Pi-Time for Claude Code: every Bash result comes back as a timeline."
+		}
+	]
+}
